@@ -1,0 +1,574 @@
+#!/usr/bin/env bash
+# ~/bin/dcw — worktree + port + Django runserver lifecycle
+# Local macOS port of the DevSpace /opt/dev-tools/dcw helper.
+# Self-contained: no /opt/dev-tools, fuser, ss, or flock dependencies.
+#
+# Commands:
+#   dcw start <branch>   create worktree, clone DB, copy private files, start server
+#                                if <branch> == base branch, start runserver in
+#                                $REPO on $PORT_BASE (no worktree — main IS $REPO)
+#   dcw stop <branch>    stop server for a branch; leaves worktree alone
+#   dcw status           list all captains + alive state
+#   dcw list             show all git worktrees (branch, port, dir)
+#   dcw abort <branch>   destroy worktree + server + worktree DB (no merge)
+#   dcw logs <branch>    tail the server log
+set -euo pipefail
+
+# ── Project config (override via env) ─────────────────────────────
+REPO="${DEV_CAPTAIN_REPO:-$HOME/dev/hmx-002}"
+VENV="${DEV_CAPTAIN_VENV:-$HOME/dev/.venv}"
+PORT_BASE="${PORT_BASE:-5201}"
+PORT_MAX="${PORT_MAX:-5220}"
+
+# ── State (in home dir, outside any project) ──────────────────────
+WT_DIR="$REPO/.worktrees"
+STATE="$HOME/.dev-captain"
+LOGDIR="$STATE/logs"
+REG="$STATE/ports.json"
+LOCK="$STATE/.lock"
+mkdir -p "$LOGDIR"
+
+# Base branch detection — prefer the branch currently checked out in $REPO
+# (it matches the shared DB's module state), fallback to origin/HEAD, then main
+if [ -d "$REPO/.git" ]; then
+  BASE=$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+  if [ -z "$BASE" ] || [ "$BASE" = "HEAD" ]; then
+    BASE=$(git -C "$REPO" rev-parse --abbrev-ref origin/HEAD 2>/dev/null | sed "s|^origin/||" || true)
+  fi
+fi
+BASE="${BASE:-main}"
+
+# ── Helpers ───────────────────────────────────────────────────────
+_locked() { # simple mutex via mkdir (no flock on macOS)
+  for _ in 1 2 3 4 5; do
+    mkdir "$LOCK" 2>/dev/null && return 0
+    sleep 0.2
+  done
+  echo "warning: could not acquire lock, proceeding without" >&2
+  return 0
+}
+_unlocked() { rmdir "$LOCK" 2>/dev/null || true; }
+
+_port_of() { # look up port for a branch (empty if none)
+  local branch="$1"
+  [ -f "$REG" ] || return 0
+  python3 -c "
+import json
+d = json.load(open('$REG'))
+for port, info in d.items():
+    b = info['branch'] if isinstance(info, dict) else info
+    if b == '$branch':
+        print(port); break
+"
+}
+
+_record_pid() { # update pid for an existing port entry
+  local port="$1" pid="$2"
+  python3 -c "
+import json, os
+d = json.load(open('$REG')) if os.path.exists('$REG') else {}
+if '$port' in d:
+    info = d['$port']
+    if isinstance(info, dict):
+        info['pid'] = $pid
+    else:
+        d['$port'] = {'branch': info, 'pid': $pid}
+else:
+    d['$port'] = {'branch': '$BASE', 'pid': $pid, 'started_at': __import__('time').time()}
+json.dump(d, open('$REG', 'w'), indent=2)
+"
+}
+
+_find_django_root() { # locate manage.py in a tree
+  local tree="$1"
+  for candidate in "." "hmx" "src" "backend" "app"; do
+    if [ -f "$tree/$candidate/manage.py" ]; then
+      echo "$tree/$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+_port_bound() { # macOS: is a TCP port bound by any process?
+  lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+# ── Per-worktree database (port of DevSpace ~/repo/scripts/dcw) ───
+_db_name_for_branch() { # branch -> postgres db name (lowercase, safe chars)
+  printf '%s\n' "$1" | tr '/[:upper:].-' '_[:lower:]__' | tr -cd '[:alnum:]_' | cut -c1-63
+}
+
+_env_value() { # read KEY= from a .env file
+  python3 - "$1" "$2" <<'PY'
+import sys
+path, key = sys.argv[1:3]
+with open(path) as fh:
+    for line in fh:
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        name, value = line.split("=", 1)
+        if name.strip() == key:
+            print(value.strip())
+            break
+PY
+}
+
+_db_conn_vars() { # set db_user/db_password/db_host/db_port from main repo .env
+  db_user=$(_env_value "$REPO/hmx/.env" DATABASE_USER)
+  db_password=$(_env_value "$REPO/hmx/.env" DATABASE_PASSWORD)
+  db_host=$(_env_value "$REPO/hmx/.env" DATABASE_HOST); db_host=${db_host:-127.0.0.1}
+  db_port=$(_env_value "$REPO/hmx/.env" DATABASE_PORT); db_port=${db_port:-5432}
+}
+
+_db_default_name() { # default.NAME from main repo db.json
+  python3 -c "
+import json
+d = json.load(open('$REPO/hmx/hmx/db.json'))
+print(d['default']['NAME'])
+" 2>/dev/null || _env_value "$REPO/hmx/.env" DATABASE_NAME
+}
+
+_db_clone() { # clone base DB -> worktree DB (template clone, dump/restore fallback)
+  local branch="$1"
+  command -v psql >/dev/null 2>&1 || { echo "  db:      psql not found; DB clone skipped" >&2; return 0; }
+  local src_db dst_db
+  src_db=$(_db_default_name)
+  dst_db=$(_db_name_for_branch "$branch")
+  _db_conn_vars
+  if PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d postgres -Atqc \
+      "SELECT 1 FROM pg_database WHERE datname = '$dst_db'" 2>/dev/null | grep -qx 1; then
+    echo "  db:      $dst_db already exists"
+    return 0
+  fi
+  echo "  db:      cloning $src_db -> $dst_db"
+  if PGPASSWORD="$db_password" createdb -h "$db_host" -p "$db_port" -U "$db_user" -T "$src_db" "$dst_db" 2>/dev/null; then
+    return 0
+  fi
+  echo "  db:      template clone failed (source DB in use?); retrying with dump/restore"
+  PGPASSWORD="$db_password" createdb -h "$db_host" -p "$db_port" -U "$db_user" "$dst_db" || return 1
+  PGPASSWORD="$db_password" pg_dump -h "$db_host" -p "$db_port" -U "$db_user" --no-owner --no-privileges "$src_db" \
+    | PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$dst_db" -q
+}
+
+_db_drop() { # drop the worktree DB
+  local branch="$1"
+  command -v dropdb >/dev/null 2>&1 || { echo "  db:      dropdb not found; DB drop skipped" >&2; return 0; }
+  local dst_db
+  dst_db=$(_db_name_for_branch "$branch")
+  _db_conn_vars
+  if ! PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d postgres -Atqc \
+      "SELECT 1 FROM pg_database WHERE datname = '$dst_db'" 2>/dev/null | grep -qx 1; then
+    echo "  db:      $dst_db does not exist"
+    return 0
+  fi
+  echo "  db:      dropping $dst_db"
+  PGPASSWORD="$db_password" dropdb -h "$db_host" -p "$db_port" -U "$db_user" --if-exists "$dst_db"
+}
+
+_set_worktree_db_json() { # point worktree db.json default.NAME at its own DB
+  local branch="$1"
+  local wt="$WT_DIR/$branch" db_json="$WT_DIR/$branch/hmx/hmx/db.json"
+  local dst_db; dst_db=$(_db_name_for_branch "$branch")
+  [ -f "$db_json" ] || { echo "  db.json: $db_json not found; skipped" >&2; return 0; }
+  python3 - "$db_json" "$dst_db" <<'PY'
+import json, sys
+path, name = sys.argv[1:3]
+with open(path) as fh:
+    data = json.load(fh)
+data["default"]["NAME"] = name
+with open(path, "w") as fh:
+    json.dump(data, fh, indent=4)
+    fh.write("\n")
+PY
+  echo "  db.json: default.NAME = $dst_db"
+}
+
+_set_worktree_env_db() { # point worktree .env DATABASE_NAME at its own DB
+  local branch="$1"
+  local env_file="$WT_DIR/$branch/hmx/.env"
+  local dst_db; dst_db=$(_db_name_for_branch "$branch")
+  [ -f "$env_file" ] || { echo "  .env:    $env_file not found; skipped" >&2; return 0; }
+  python3 - "$env_file" "$dst_db" <<'PY'
+import sys
+path, name = sys.argv[1:3]
+with open(path) as fh:
+    lines = fh.read().splitlines()
+out, seen = [], False
+for line in lines:
+    if line.startswith("DATABASE_NAME="):
+        out.append(f"DATABASE_NAME={name}")
+        seen = True
+    else:
+        out.append(line)
+if not seen:
+    out.append(f"DATABASE_NAME={name}")
+with open(path, "w") as fh:
+    fh.write("\n".join(out) + "\n")
+PY
+  echo "  .env:    DATABASE_NAME = $dst_db"
+}
+
+_copy_private_paths() { # copy agent/config files repo -> worktree (once), git-exclude them
+  local branch="$1"
+  local wt="$WT_DIR/$branch"
+  local name src dst exclude
+  for name in ".agents" ".claude" ".vscode" "AGENTS.md" "CLAUDE.md" "hmx/hmx/db.json"; do
+    src="$REPO/$name"
+    dst="$wt/$name"
+    [ -e "$src" ] || continue            # source missing (e.g. CLAUDE.md) — fine
+    [ -e "$dst" ] || {                   # copy only if not already there
+      mkdir -p "$(dirname "$dst")"
+      cp -a "$src" "$dst"
+      echo "  copy:    $dst <- $src"
+    }
+    # add to worktree-local git exclude so it never gets committed
+    exclude=$(git -C "$wt" rev-parse --git-path info/exclude 2>/dev/null || true)
+    case "$exclude" in /*) ;; *) exclude="$wt/$exclude" ;; esac
+    if [ -n "$exclude" ] && [ -f "$exclude" ]; then
+      grep -Fxq "/$name" "$exclude" || printf '/%s\n' "$name" >> "$exclude"
+    fi
+  done
+}
+
+_start_server() { # start runserver in dir on port, track pid
+  local tree="$1" port="$2" log="$3"
+  local django_root
+  django_root=$(_find_django_root "$tree") || {
+    echo "⚠  manage.py not found in $tree (or common subdirs) — server NOT started" >&2
+    return 1
+  }
+  cd "$django_root"
+  # shellcheck disable=SC1091
+  [ -f "$VENV/bin/activate" ] && source "$VENV/bin/activate"
+  if [ -x "$VENV/bin/hmx" ]; then          # DevSpace-style: hmx CLI from hmx_license
+    nohup "$VENV/bin/hmx" runserver "127.0.0.1:$port" > "$log" 2>&1 &
+  elif command -v hmx >/dev/null 2>&1; then
+    nohup hmx runserver "127.0.0.1:$port" > "$log" 2>&1 &
+  else                                     # local fallback: plain manage.py
+    nohup python3 manage.py runserver "127.0.0.1:$port" --noreload > "$log" 2>&1 &
+  fi
+  local pid=$!
+  disown
+  _record_pid "$port" "$pid"
+  echo "$pid"
+}
+
+_pid_for_port() { # live pid recorded for a port
+  local port="$1"
+  [ -f "$REG" ] || return 0
+  python3 -c "
+import json, os
+d = json.load(open('$REG'))
+info = d.get('$port')
+if isinstance(info, dict):
+    pid = info.get('pid', 0)
+    if pid:
+        try: os.kill(int(pid), 0); print(pid)
+        except: pass
+" 2>/dev/null
+}
+
+_kill_port() { # SIGTERM grace + SIGKILL (macOS: lsof, no fuser)
+  local port="$1"
+  # Kill recorded parent pid first (reloader parent may respawn a killed child)
+  local rec_pid
+  rec_pid=$(python3 -c "
+import json
+try:
+    d = json.load(open('$REG'))
+    info = d.get('$port')
+    if isinstance(info, dict) and info.get('pid'):
+        print(info['pid'])
+except Exception: pass
+" 2>/dev/null || true)
+  [ -n "$rec_pid" ] && kill -TERM "$rec_pid" 2>/dev/null || true
+  local pids
+  pids=$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)
+  [ -n "$pids" ] && echo "$pids" | xargs kill -TERM 2>/dev/null || true
+  sleep 1
+  [ -n "$rec_pid" ] && kill -KILL "$rec_pid" 2>/dev/null || true
+  pids=$(lsof -tiTCP:"$port" -sTCP:LISTEN 2>/dev/null || true)
+  [ -n "$pids" ] && echo "$pids" | xargs kill -KILL 2>/dev/null || true
+  # Clear pid from registry (keep the port entry if it's the base branch)
+  python3 -c "
+import json, os
+d = json.load(open('$REG')) if os.path.exists('$REG') else {}
+info = d.get('$port')
+if isinstance(info, dict) and info.get('branch') == '$BASE':
+    info['pid'] = 0
+    d['$port'] = info
+elif '$port' in d:
+    del d['$port']
+json.dump(d, open('$REG', 'w'), indent=2)
+" || true
+}
+
+_port_alloc() { # allocate first free port in [PORT_BASE+1, PORT_MAX-1]
+  local branch="$1" p
+  _locked
+  [ -f "$REG" ] || echo '{}' > "$REG"
+  local existing
+  existing=$(_port_of "$branch")
+  if [ -n "$existing" ]; then _unlocked; echo "$existing"; return 0; fi
+  for p in $(seq $((PORT_BASE+1)) $((PORT_MAX-1))); do
+    if python3 -c "import json,sys; d=json.load(open('$REG')); sys.exit(0 if '$p' in d else 1)" 2>/dev/null; then
+      continue
+    fi
+    if _port_bound "$p"; then continue; fi
+    python3 - "$REG" "$p" "$branch" <<'PYCLAIM'
+import json, sys
+reg, port, branch = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(reg))
+d[port] = {"branch": branch, "pid": 0, "started_at": __import__("time").time()}
+json.dump(d, open(reg, "w"), indent=2)
+PYCLAIM
+    _unlocked
+    echo "$p"
+    return 0
+  done
+  _unlocked
+  echo "error: no free port in $((PORT_BASE+1))-$((PORT_MAX-1))" >&2
+  return 1
+}
+
+_port_free() { # release a port registration (by port or branch)
+  local key="${1:?}"
+  _locked
+  [ -f "$REG" ] && python3 - "$REG" "$key" <<'PYFREE'
+import json, sys
+reg, key = sys.argv[1], sys.argv[2]
+d = json.load(open(reg))
+out = {}
+for port, info in d.items():
+    b = info['branch'] if isinstance(info, dict) else info
+    if port == key or b == key:
+        continue
+    out[port] = info
+json.dump(out, open(reg, "w"), indent=2)
+PYFREE
+  _unlocked
+}
+
+cmd="${1:-help}"; shift || true
+
+case "$cmd" in
+  start)
+    branch="${1:?usage: dcw start <branch>}"
+
+    [ -d "$REPO/.git" ] || { echo "error: $REPO is not a git repo — clone first" >&2; exit 2; }
+
+    if [ "$branch" = "$BASE" ]; then
+      # ── BASE BRANCH FAST PATH — no worktree, $REPO on PORT_BASE ──
+      port="$PORT_BASE"
+      existing_pid=$(_pid_for_port "$port")
+      if [ -n "$existing_pid" ]; then
+        echo "✓ $branch already running (pid $existing_pid) on port $port"
+        echo "  preview: http://127.0.0.1:$port"
+        exit 0
+      fi
+      log="$LOGDIR/main.log"
+      pid=$(_start_server "$REPO" "$port" "$log")
+      echo "✓ captain started: $branch (base)"
+      echo "  dir:     $REPO"
+      echo "  port:    $port  (pid $pid)"
+      echo "  preview: http://127.0.0.1:$port"
+      echo "  log:     $log"
+      exit 0
+    fi
+
+    # ── WORKTREE PATH ──
+    wt="$WT_DIR/$branch"
+    if [ ! -d "$wt" ]; then
+      cd "$REPO"
+      if ! git fetch origin 2>&1 | tail -3; then
+        echo "dcw: warning: git fetch origin failed; using existing local refs" >&2
+      fi
+      if git show-ref --verify --quiet "refs/heads/$branch"; then
+        git worktree add "$wt" "$branch"
+      elif git show-ref --verify --quiet "refs/heads/$BASE"; then
+        git worktree add -b "$branch" "$wt" "$BASE"
+      else
+        git worktree add -b "$branch" "$wt" "origin/$BASE"
+      fi
+    fi
+
+# Copy .env from main repo into worktree (gitignored, so never travels with git)
+    for env_src in "$REPO/hmx/.env" "$REPO/.env"; do
+      env_dst="${env_src/#$REPO/$wt}"
+      if [ -f "$env_src" ] && [ ! -f "$env_dst" ]; then
+        cp "$env_src" "$env_dst"
+        echo "  env:     copied $(basename "$(dirname "$env_src")")/.env → worktree"
+      fi
+    done
+
+    # Per-worktree DB + private files (like DevSpace dcw)
+    _copy_private_paths "$branch"
+    _db_clone "$branch"
+    _set_worktree_db_json "$branch"
+    _set_worktree_env_db "$branch"
+
+    port=$(_port_alloc "$branch")
+
+    existing_pid=$(_pid_for_port "$port")
+    if [ -n "$existing_pid" ]; then
+      echo "already running (pid $existing_pid)"
+      echo "  preview: http://127.0.0.1:$port"
+      exit 0
+    fi
+
+    log="$LOGDIR/$(echo "$branch" | tr '/' '_').log"
+    pid=$(_start_server "$wt" "$port" "$log") || {
+      echo "⚠ worktree + port reserved; spawn manually when ready"
+      exit 0
+    }
+
+    echo "✓ captain started: $branch"
+    echo "  worktree: $wt"
+    echo "  port:     $port  (pid $pid)"
+    echo "  preview:  http://127.0.0.1:$port"
+    echo "  log:      $log"
+    ;;
+
+  stop)
+    branch="${1:?usage: dcw stop <branch>}"
+    port=$(_port_of "$branch")
+    if [ -z "$port" ]; then
+      if [ "$branch" = "$BASE" ]; then
+        port="$PORT_BASE"
+      else
+        echo "no captain running for $branch"
+        exit 0
+      fi
+    fi
+    _kill_port "$port"
+    echo "✓ stopped $branch (port $port) — worktree/branch left intact"
+    ;;
+
+  status|ps)
+    if [ ! -f "$REG" ] || [ "$(cat "$REG")" = "{}" ]; then
+      echo "(no active captains)"
+      exit 0
+    fi
+    python3 <<PYSTAT
+import json, os
+d = json.load(open("$REG"))
+print(f"{'PORT':<7}{'BRANCH':<40}{'PID':<10}{'STATUS':<10}URL")
+for port, info in sorted(d.items(), key=lambda x: int(x[0])):
+    if isinstance(info, dict):
+        branch = info.get("branch","?")
+        pid = info.get("pid", 0)
+    else:
+        branch, pid = info, 0
+    alive = False
+    if pid:
+        try: os.kill(int(pid), 0); alive = True
+        except: pass
+    status = "up" if alive else ("reserved" if pid == 0 else "dead")
+    url = f"http://127.0.0.1:{port}"
+    print(f"{port:<7}{branch:<40}{str(pid):<10}{status:<10}{url}")
+PYSTAT
+    ;;
+
+  list|worktrees|wt)
+    [ -d "$REPO/.git" ] || { echo "error: $REPO is not a git repo" >&2; exit 2; }
+    python3 - "$REPO" "$REG" <<'PYLIST'
+import json, os, subprocess, sys
+repo, reg = sys.argv[1], sys.argv[2]
+try:
+    entries = json.load(open(reg))
+except Exception:
+    entries = {}
+branch_port = {}
+for port, info in entries.items():
+    b = info.get("branch") if isinstance(info, dict) else info
+    if b:
+        branch_port[b] = port
+out = subprocess.run(
+    ["git", "-C", repo, "worktree", "list", "--porcelain"],
+    capture_output=True, text=True,
+).stdout
+blocks = [b for b in out.strip().split("\n\n") if b.strip()]
+print(f"{'BRANCH':<32}{'PORT':<7}{'HEAD':<10}DIR")
+for block in blocks:
+    wt = branch = head = ""
+    for line in block.splitlines():
+        if line.startswith("worktree "):
+            wt = line[len("worktree "):]
+        elif line.startswith("branch "):
+            branch = line[len("branch "):].replace("refs/heads/", "")
+        elif line.startswith("HEAD "):
+            head = line[len("HEAD "):][:9]
+    rel = os.path.relpath(wt, repo)
+    display = "(repo)" if rel == "." else rel
+    if not branch:
+        branch = "(detached)"
+    port = str(branch_port.get(branch, "-")) if branch != "(detached)" else "-"
+    print(f"{branch:<32}{port:<7}{head:<10}{display}")
+PYLIST
+    ;;
+
+  abort)
+    branch="${1:?usage: dcw abort <branch>}"
+    if [ "$branch" = "$BASE" ]; then
+      echo "error: cannot abort '$BASE' — that would destroy $REPO. Use 'dcw stop $BASE' to just stop the server." >&2
+      exit 2
+    fi
+    wt="$WT_DIR/$branch"
+    port=$(_port_of "$branch")
+
+    echo "Will: destroy worktree $wt and free port $port. NO merge."
+    read -r -p "Proceed? [y/N] " yn
+    [[ "$yn" =~ ^[Yy]$ ]] || { echo "aborted"; exit 1; }
+
+    if [ -n "$port" ]; then
+      _kill_port "$port"
+      _port_free "$port"
+    fi
+    [ -d "$wt" ] && git -C "$REPO" worktree remove --force "$wt"
+    git -C "$REPO" branch -D "$branch" 2>/dev/null || true
+    _db_drop "$branch"
+    echo "✓ aborted $branch"
+    ;;
+
+  logs)
+    branch="${1:?usage: dcw logs <branch>}"
+    if [ "$branch" = "$BASE" ]; then
+      log="$LOGDIR/main.log"
+    else
+      log="$LOGDIR/$(echo "$branch" | tr '/' '_').log"
+    fi
+    [ -f "$log" ] || { echo "no log at $log" >&2; exit 2; }
+    exec tail -f "$log"
+    ;;
+
+  *)
+    cat <<HELP
+dcw (local) — worktree + port + Django server lifecycle for $REPO
+
+Usage:
+  dcw start <branch>      Create worktree, clone DB (hmxmain → per-branch DB),
+                                  copy private files (.agents/.claude/AGENTS.md/.env/db.json),
+                                  point worktree .env + db.json at its own DB, start server
+                                  If <branch> == $BASE (base), runs in $REPO on port $PORT_BASE
+  dcw stop <branch>       Stop server for a branch; keeps worktree + branch
+  dcw status              List active captains with URLs + alive-state
+  dcw list                Show all git worktrees (branch, port, dir)
+  dcw abort <branch>      Stop server → destroy worktree → free port → DROP worktree DB
+  dcw logs <branch>       Tail the server log
+
+State:
+  Port registry:  $REG
+  Logs:           $LOGDIR/
+  Worktrees:      $WT_DIR/<branch>
+  Ports range:    $PORT_BASE (base: $BASE) + $((PORT_BASE+1))-$((PORT_MAX-1)) (worktrees)
+
+Env overrides:
+  DEV_CAPTAIN_REPO   repo root      (default: \$HOME/dev/hmx-002)
+  DEV_CAPTAIN_VENV   venv path      (default: \$HOME/dev/.venv)
+  PORT_BASE          base port      (default: 5201)
+  PORT_MAX           max port       (default: 5220)
+HELP
+    ;;
+esac
