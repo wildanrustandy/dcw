@@ -3,4 +3,6 @@
 set -euo pipefail
 BIN_DIR="${1:-$HOME/bin}"
 rm -f "$BIN_DIR/dcw" && echo "✓ removed $BIN_DIR/dcw"
-echo "  (worktrees in <repo>/.worktrees/, DB clones, and ~/.dev-captain/ are left alone)"
+CONFIG="$HOME/.config/dcw/config"
+rm -f "$CONFIG" && echo "✓ removed $CONFIG"
+echo "  (worktrees in <repo>/.worktrees/, cloned DBs, and ~/.dev-captain/ are left alone)"

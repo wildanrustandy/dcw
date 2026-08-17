@@ -14,6 +14,12 @@
 #   dcw logs <branch>    tail the server log
 set -euo pipefail
 
+# Optional user config (written by install.sh): ~/.config/dcw/config
+# Precedence: environment variables > config file > built-in defaults
+DCW_CONFIG="${DCW_CONFIG:-$HOME/.config/dcw/config}"
+# shellcheck disable=SC1091
+[ -f "$DCW_CONFIG" ] && source "$DCW_CONFIG"
+
 # ── Project config (override via env) ─────────────────────────────
 REPO="${DEV_CAPTAIN_REPO:-$HOME/dev/hmx-002}"
 VENV="${DEV_CAPTAIN_VENV:-$HOME/dev/.venv}"

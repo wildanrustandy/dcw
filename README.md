@@ -18,8 +18,22 @@ git clone <repo-ini> ~/dcw
 ~/dcw/install.sh
 ```
 
-Installer menyalin `dcw` ke `~/bin` (ikut PATH) dan mengecek dependency
-(`git`, `python3`, `lsof`, PostgreSQL client tools).
+Installer **interaktif** — akan menanyakan:
+
+1. Folder project HMX (default `~/dev/hmx-002`)
+2. Folder venv Python (default `~/dev/.venv`)
+3. Base port & max port (default `5201`–`5220`)
+
+Jawaban tersimpan di `~/.config/dcw/config` dan dibaca `dcw` setiap kali jalan.
+Bisa juga non-interaktif lewat flag:
+
+```sh
+~/dcw/install.sh --repo ~/work/hmx --venv ~/work/venv --port-base 5300 --port-max 5320 --yes
+```
+
+Prioritas konfigurasi: **env variable per-call** > **config file** > *default bawaan*.
+Installer juga mengecek dependency (`git`, `python3`, `lsof`, PostgreSQL client tools)
+dan memvalidasi path repo/venv yang dimasukkan.
 
 ### Prasyarat
 
@@ -29,13 +43,13 @@ Installer menyalin `dcw` ke `~/bin` (ikut PATH) dan mengecek dependency
    `psql`, `createdb`, `dropdb`, `pg_dump` — `brew install postgresql@16 libpq`)
 4. Kredensial DB dibaca otomatis dari `<repo>/hmx/.env` (`DATABASE_*`)
 
-Kalau lokasi Anda beda, cukup set env sebelum memanggil:
+Kalau lokasi Anda beda dari yang dipilih saat install, cukup set env sebelum memanggil (override sekali jalan):
 
 ```sh
-export DEV_CAPTAIN_REPO="$HOME/dev/hmx-002"   # lokasi repo
-export DEV_CAPTAIN_VENV="$HOME/dev/.venv"     # lokasi venv
-export PORT_BASE=5201 PORT_MAX=5220           # rentang port
+DEV_CAPTAIN_REPO="$HOME/dev/hmx-002" DEV_CAPTAIN_VENV="$HOME/dev/.venv" dcw start <branch>
 ```
+
+atau edit `~/.config/dcw/config`.
 
 ## Usage
 
