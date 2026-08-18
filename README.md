@@ -6,7 +6,7 @@ Manajemen **git worktree + port + server Django HMX** dalam satu command — di-
 Setiap feature branch mendapat:
 
 - **Worktree** sendiri di `<repo>/.worktrees/<branch>`
-- **Port** sendiri (base `5201`, worktree `5202+`)
+- **Port** sendiri (base `5200`, worktree `5201+`)
 - **Database clone** sendiri (`hmxmain` → DB per-branch, via `createdb -T`, fallback dump/restore)
 - **File privat** tersalin otomatis: `.agents`, `.claude`, `.vscode`, `AGENTS.md`, `hmx/.env`, `hmx/hmx/db.json`
 - `.env` dan `db.json` worktree otomatis diarahkan ke DB branch tersebut (data utama aman)
@@ -22,7 +22,7 @@ Installer **interaktif** — akan menanyakan:
 
 1. Folder project HMX (default `~/dev/hmx-002`)
 2. Folder venv Python (default `~/dev/.venv`)
-3. Base port & max port (default `5201`–`5220`)
+3. Base port & max port (default `5200` & `5220` — base branch on `5200`, worktrees use `5201+`)
 
 Jawaban tersimpan di `~/.config/dcw/config` dan dibaca `dcw` setiap kali jalan.
 Bisa juga non-interaktif lewat flag:
@@ -68,10 +68,10 @@ Contoh:
 dcw start wildantest
 # ✓ captain started: wildantest
 #   worktree: ~/dev/hmx-002/.worktrees/wildantest
-#   port:     5202   preview: http://127.0.0.1:5202
+#   port:     5201   preview: http://127.0.0.1:5201
 #   db:       cloning hmxmain -> wildantest
 
-dcw start Inventory   # base branch → langsung di repo utama, port 5201
+dcw start Inventory   # base branch → langsung di repo utama, port 5200
 ```
 
 Base branch dideteksi dari branch yang aktif di repo (fallback `origin/HEAD`).

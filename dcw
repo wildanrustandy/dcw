@@ -23,7 +23,7 @@ DCW_CONFIG="${DCW_CONFIG:-$HOME/.config/dcw/config}"
 # ── Project config (override via env) ─────────────────────────────
 REPO="${DEV_CAPTAIN_REPO:-$HOME/dev/hmx-002}"
 VENV="${DEV_CAPTAIN_VENV:-$HOME/dev/.venv}"
-PORT_BASE="${PORT_BASE:-5201}"
+PORT_BASE="${PORT_BASE:-5200}"
 PORT_MAX="${PORT_MAX:-5220}"
 
 # ── State (in home dir, outside any project) ──────────────────────

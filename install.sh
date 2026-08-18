@@ -12,7 +12,7 @@ Options:
   --bin DIR        install dcw into DIR                (default: ~/bin)
   --repo PATH      HMX project root                    (default: ~/dev/hmx-002)
   --venv PATH      python venv path                    (default: ~/dev/.venv)
-  --port-base N    base port for the base branch       (default: 5201)
+  --port-base N    base port for the base branch       (default: 5200)
   --port-max N     upper bound of the port range       (default: 5220)
   --yes            accept answers non-interactively (use flags/defaults)
   -h, --help       this help
@@ -64,7 +64,7 @@ fi
 # ── interactive questions (defaults shown in brackets) ────────────
 REPO_PATH="${ANS_REPO:-$HOME/dev/hmx-002}"
 VENV_PATH="${ANS_VENV:-$HOME/dev/.venv}"
-PORT_BASE="${ANS_PBASE:-5201}"
+PORT_BASE="${ANS_PBASE:-5200}"
 PORT_MAX="${ANS_PMAX:-5220}"
 
 if [ "$INTERACTIVE" = 1 ]; then
