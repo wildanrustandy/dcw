@@ -31,9 +31,36 @@ Bisa juga non-interaktif lewat flag:
 ~/dcw/install.sh --repo ~/work/hmx --venv ~/work/venv --port-base 5300 --port-max 5320 --yes
 ```
 
+### Lokasi binary & PATH
+
+`--bin DIR` menentukan folder instalasi. Defaultnya **auto**: folder pertama dari
+`~/.local/bin`, `~/bin` yang **sudah ada di PATH shell login**; kalau dua-duanya tidak ada,
+`~/.local/bin`.
+
+Installer tidak mempercayai `$SHELL`. Dia **menanyakan shell login yang sebenarnya**
+(lalu membunuhnya lagi dengan SIGKILL kalau rc-nya menggantung) untuk tahu PATH yang
+benar-benar dipakai terminal baru, dan menulis PATH ke file rc yang shell itu baca:
+
+| Shell login | File rc |
+|---|---|
+| zsh | `~/.zshenv` (dibaca semua zsh: login, interaktif, skrip) |
+| bash | `~/.bashrc`, lalu escalate ke `~/.bash_profile` / `~/.bash_login` / `~/.profile` |
+| fish | `~/.config/fish/config.fish` |
+
+Setiap tulisan langsung **diverifikasi** dengan menanyakan ulang shell login. Ini penting di
+host tanpa root: `/etc/passwd` masih menunjuk `/bin/bash` (karena `chsh` butuh root)
+sementara `~/.bashrc` men-`exec` zsh user-local — di setup itu baris PATH di `~/.bashrc`
+tidak pernah dieksekusi dan zsh tidak membaca `.bashrc` sama sekali. Login bash juga tidak
+membaca `~/.bashrc`, jadi kalau verifikasi gagal installer naik ke kandidat berikutnya
+alih-alih melaporkan sukses palsu.
+
 Prioritas konfigurasi: **env variable per-call** > **config file** > *default bawaan*.
 Installer juga mengecek dependency (`git`, `python3`, `lsof`, PostgreSQL client tools)
 dan memvalidasi path repo/venv yang dimasukkan.
+
+Perubahan `install.sh` sebaiknya diverifikasi dengan `./test-install.sh` (27 asersi:
+deteksi shell login, penulisan PATH, idempotensi, anti-hang). Pakai
+`SKIP_LIVE=1 ./test-install.sh` untuk melewati asersi instalasi di host ini.
 
 ### Prasyarat
 

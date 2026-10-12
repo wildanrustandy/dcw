@@ -9,7 +9,7 @@ usage() {
 Usage: ./install.sh [options]
 
 Options:
-  --bin DIR        install dcw into DIR                (default: ~/bin)
+  --bin DIR        install dcw into DIR                (default: auto, see below)
   --repo PATH      HMX project root                    (default: ~/dev/hmx-002)
   --venv PATH      python venv path                    (default: ~/dev/.venv)
   --port-base N    base port for the base branch       (default: 5200)
@@ -19,11 +19,18 @@ Options:
 
 Answers are saved to ~/.config/dcw/config (dcw reads it at runtime).
 Environment variables still override the config per-call.
+
+--bin default is the first of ~/.local/bin, ~/bin that the LOGIN shell already
+searches, else ~/.local/bin. PATH is appended to the rc file that shell really
+reads (~/.zshenv for zsh; ~/.bashrc plus the login file for bash), then the
+installer re-asks the shell to confirm it took effect. $SHELL is never trusted:
+on a no-root host /etc/passwd still says bash while ~/.bashrc re-execs a
+user-local zsh.
 EOF
 }
 
 # ── defaults ──────────────────────────────────────────────────────
-BIN_DIR="$HOME/bin"
+BIN_DIR=""                  # empty = auto-pick, resolved once the login PATH is known
 ANS_REPO=""
 ANS_VENV=""
 ANS_PBASE=""
@@ -47,6 +54,63 @@ done
 SRC="$(cd "$(dirname "$0")" && pwd)/dcw"
 [ -f "$SRC" ] || { echo "error: dcw script not found next to install.sh" >&2; exit 1; }
 
+# ── shell / PATH detection ────────────────────────────────────────
+# $SHELL lies on a no-root host: /etc/passwd still says /bin/bash (chsh needs
+# root) while ~/.bashrc re-execs a user-local zsh. In that setup the PATH line
+# written to ~/.bashrc is never executed, and zsh never reads ~/.bashrc at all.
+# So: find the shell a NEW terminal actually starts, and read PATH from it.
+
+_login_shell() { # shell a new terminal will run
+  local sh="${SHELL:-/bin/sh}" hit
+  if [ -f "$HOME/.bashrc" ]; then
+    hit=$(grep -E '^[[:space:]]*exec[[:space:]]+.*(zsh|fish)' "$HOME/.bashrc" 2>/dev/null | head -1 || true)
+    case "$hit" in
+      *zsh*)  if [ -x "$HOME/.local/zsh/bin/zsh" ]; then sh="$HOME/.local/zsh/bin/zsh"
+              else sh=$(command -v zsh 2>/dev/null || printf '%s' "$sh"); fi ;;
+      *fish*) sh=$(command -v fish 2>/dev/null || printf '%s' "$sh") ;;
+    esac
+  fi
+  printf '%s' "$sh"
+}
+
+_rc_candidates_for() { # rc files to try, in order, for a given shell
+  case "$(basename "${1:-sh}")" in
+    zsh)  printf '%s\n' "$HOME/.zshenv" ;;   # read by every zsh: login, interactive, script
+    bash)
+      printf '%s\n' "$HOME/.bashrc"          # non-login interactive (most terminals, ttyd)
+      for f in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+        if [ -e "$f" ]; then printf '%s\n' "$f"; return 0; fi   # first one a LOGIN bash reads
+      done
+      printf '%s\n' "$HOME/.bash_profile"    # none exists -> creating it shadows nothing
+      ;;
+    fish) printf '%s\n' "$HOME/.config/fish/config.fish" ;;
+    *)    printf '%s\n' "$HOME/.profile" ;;
+  esac
+}
+
+_login_path() { # PATH a fresh login shell gets; empty if it cannot be asked
+  local sh="$1" tmp pid n=0 raw
+  tmp=$(mktemp 2>/dev/null || printf '%s' "$HOME/.dcw.loginpath.$$")
+  ( "$sh" -lic 'printf "\n__DCW_PATH__%s\n" "$PATH"' >"$tmp" 2>/dev/null ) &
+  pid=$!
+  # An rc file can hang (waiting on input, network, a sleeping hook). Poll, then
+  # SIGKILL: an INTERACTIVE shell ignores SIGTERM, so TERM alone would let
+  # `wait` block for as long as the rc file does.
+  while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 30 ]; do sleep 0.1; n=$((n+1)); done
+  kill -TERM "$pid" 2>/dev/null || true
+  sleep 0.2
+  kill -KILL "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  raw=$(cat "$tmp" 2>/dev/null || true)
+  rm -f "$tmp"
+  case "$raw" in
+    *__DCW_PATH__*) raw=${raw##*__DCW_PATH__}   # last marker: rc files may print too
+                    raw=${raw%%$'\n'*} ;;
+    *)              raw="" ;;                   # could not query the shell
+  esac
+  printf '%s' "$raw"
+}
+
 INTERACTIVE=0
 if [ "$ASSUME_YES" = 0 ] && [ -t 0 ] && [ -t 1 ]; then
   INTERACTIVE=1
@@ -55,6 +119,24 @@ fi
 # expand ~ in flag values
 expand() { local v="${1/#\~/$HOME}"; printf '%s' "$v"; }
 ANS_REPO=$(expand "$ANS_REPO"); ANS_VENV=$(expand "$ANS_VENV")
+BIN_DIR=$(expand "$BIN_DIR")
+
+# ── resolve install dir against the login shell's real PATH ───────
+LOGIN_SHELL=$(_login_shell)
+LOGIN_PATH=$(_login_path "$LOGIN_SHELL")
+ASKED=1
+if [ -z "$LOGIN_PATH" ]; then      # shell could not be queried — fall back, and say so later
+  ASKED=0
+  LOGIN_PATH="$PATH"
+fi
+if [ -z "$BIN_DIR" ]; then
+  for cand in "$HOME/.local/bin" "$HOME/bin"; do
+    case ":$LOGIN_PATH:" in
+      *":$cand:"*) BIN_DIR="$cand"; break ;;
+    esac
+  done
+  [ -n "$BIN_DIR" ] || BIN_DIR="$HOME/.local/bin"
+fi
 
 echo "== dcw installer =="
 if [ "$INTERACTIVE" = 0 ] && [ "$ASSUME_YES" = 0 ]; then
@@ -117,20 +199,43 @@ EOF
 echo "✓ config:   $CONFIG_DIR/config"
 
 # ── PATH ──────────────────────────────────────────────────────────
-case ":$PATH:" in
-  *":$BIN_DIR:"*) echo "✓ PATH: $BIN_DIR already present" ;;
+# Edit the rc files, then RE-ASK the login shell. A login bash does not read
+# ~/.bashrc, so the first candidate can silently do nothing — escalate to the
+# next one instead of trusting the edit.
+case ":$LOGIN_PATH:" in
+  *":$BIN_DIR:"*)
+    echo "✓ PATH: $BIN_DIR already on the login shell's PATH ($LOGIN_SHELL)"
+    ;;
   *)
-    SHELL_RC="$HOME/.zshrc"
-    case "$SHELL" in *bash*) SHELL_RC="$HOME/.bashrc" ;; esac
-    printf '\n# added by dcw installer\nexport PATH="%s:$PATH"\n' "$BIN_DIR" >> "$SHELL_RC"
-    echo "✓ PATH: added $BIN_DIR to $SHELL_RC"
-    echo "  → run: source $SHELL_RC   (or open a new terminal)"
+    VERIFIED=0
+    for SHELL_RC in $(_rc_candidates_for "$LOGIN_SHELL"); do
+      mkdir -p "$(dirname "$SHELL_RC")"
+      if [ -f "$SHELL_RC" ] && grep -Fq "export PATH=\"$BIN_DIR:" "$SHELL_RC"; then
+        echo "✓ PATH: $BIN_DIR already declared in $SHELL_RC"
+      else
+        printf '\n# added by dcw installer\nexport PATH="%s:$PATH"\n' "$BIN_DIR" >> "$SHELL_RC"
+        echo "✓ PATH: added $BIN_DIR to $SHELL_RC"
+      fi
+      [ "$ASKED" = 1 ] || break
+      case ":$(_login_path "$LOGIN_SHELL"):" in
+        *":$BIN_DIR:"*)
+          echo "  ✓ verified: $LOGIN_SHELL resolves $BIN_DIR/dcw"
+          VERIFIED=1; break ;;
+      esac
+    done
+    if [ "$ASKED" = 0 ]; then
+      echo "  ⚠ could not query $LOGIN_SHELL — open a new terminal to confirm"
+    elif [ "$VERIFIED" = 0 ]; then
+      echo "  ⚠ unverified: $BIN_DIR still missing from $LOGIN_SHELL's PATH"
+      echo "    add it manually to one of: $(_rc_candidates_for "$LOGIN_SHELL" | tr '\n' ' ')"
+    fi
     ;;
 esac
 
 # ── summary ───────────────────────────────────────────────────────
 echo ""
 echo "== summary =="
+echo "  bin:        $BIN_DIR"
 echo "  repo:       $REPO_PATH"
 echo "  venv:       $VENV_PATH"
 echo "  ports:      $PORT_BASE-$PORT_MAX"
