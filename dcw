@@ -1,17 +1,28 @@
 #!/usr/bin/env bash
-# ~/bin/dcw — worktree + port + Django runserver lifecycle
-# Local macOS port of the DevSpace /opt/dev-tools/dcw helper.
+# dcw — worktree + port + Django server + Celery lifecycle
+# Local port of the DevSpace /opt/dev-tools/dev-captain + dcw helpers.
 # Self-contained: no /opt/dev-tools, fuser, ss, or flock dependencies.
 #
 # Commands:
-#   dcw start <branch>   create worktree, clone DB, copy private files, start server
-#                                if <branch> == base branch, start runserver in
-#                                $REPO on $PORT_BASE (no worktree — main IS $REPO)
-#   dcw stop <branch>    stop server for a branch; leaves worktree alone
-#   dcw status           list all captains + alive state
+#   dcw start <branch>   create worktree, clone DB, copy private files, point the
+#                        worktree .env at its own DB + Redis namespace, then start
+#                        the server and a per-branch Celery worker.
+#                        if <branch> == base branch, runs in $REPO on $PORT_BASE
+#                        (no worktree — main IS $REPO)
+#   dcw stop <branch>    stop server + worker; leaves worktree/branch alone
+#   dcw status           list all captains (port, pid, alive, celery) + URLs
 #   dcw list             show all git worktrees (branch, port, dir)
-#   dcw abort <branch>   destroy worktree + server + worktree DB (no merge)
-#   dcw logs <branch>    tail the server log
+#   dcw abort <branch>   destroy worktree + server + worker + worktree DB (no merge)
+#   dcw logs <branch> [celery]
+#                        tail the server log, or the branch's worker log
+#   dcw celery start|restart|stop|status [branch]
+#                        manage a branch's worker (default: base branch)
+#
+# Isolation: each worktree gets HMX_INSTANCE_NAMESPACE=<base ns>-<db name>, and HMX
+# derives every Redis key from it (hmx:<sha256(ns)>:{celery,celery-result,cache,
+# celery-healthcheck}). Branches therefore share Redis DB indexes but never see each
+# other's queues, results, cache or realtime events. Beat is deliberately NOT started
+# per branch — multiple beats would double-fire schedules against the same DB.
 set -euo pipefail
 
 # Optional user config (written by install.sh): ~/.config/dcw/config
@@ -26,13 +37,24 @@ VENV="${DEV_CAPTAIN_VENV:-$HOME/dev/.venv}"
 PORT_BASE="${PORT_BASE:-5200}"
 PORT_MAX="${PORT_MAX:-5220}"
 
+# ── Per-branch Celery (opt out with DCW_CELERY=0) ─────────────────
+# One worker per branch, isolated from every other branch by the branch's
+# HMX_INSTANCE_NAMESPACE (see _set_worktree_env_namespace). Queues default to
+# every queue the app routes to, so a branch's dev stack consumes its own tasks
+# instead of leaving them queued forever.
+CELERY_ENABLED="${DCW_CELERY:-1}"
+CELERY_QUEUES="${DCW_CELERY_QUEUES:-interactive,import,export,scheduled,notifications,csv,data_import,demo_pool,celery}"
+CELERY_CONCURRENCY="${DCW_CELERY_CONCURRENCY:-2}"
+CELERY_LOGLEVEL="${DCW_CELERY_LOGLEVEL:-INFO}"
+
 # ── State (in home dir, outside any project) ──────────────────────
 WT_DIR="$REPO/.worktrees"
 STATE="$HOME/.dev-captain"
 LOGDIR="$STATE/logs"
 REG="$STATE/ports.json"
 LOCK="$STATE/.lock"
-mkdir -p "$LOGDIR"
+CELERY_STATE="$STATE/celery"
+mkdir -p "$LOGDIR" "$CELERY_STATE"
 
 # Base branch detection — prefer the branch currently checked out in $REPO
 # (it matches the shared DB's module state), fallback to origin/HEAD, then main
@@ -216,6 +238,180 @@ PY
   echo "  .env:    DATABASE_NAME = $dst_db"
 }
 
+_set_worktree_env_namespace() { # give this worktree its own Redis key scope
+  # HMX derives EVERY Redis key from HMX_INSTANCE_NAMESPACE (sha256 -> scope):
+  #   hmx:<scope>:celery:        broker queues + results
+  #   hmx:<scope>:cache          django cache
+  #   hmx:<scope>:celery-healthcheck
+  # So a distinct namespace per branch isolates Celery and the cache without
+  # touching the shared Redis DB indexes. Web and worker MUST agree, which is
+  # why this is written to the worktree .env rather than exported per process.
+  local branch="$1"
+  local env_file="$WT_DIR/$branch/hmx/.env"
+  [ -f "$env_file" ] || { echo "  .env:    $env_file not found; namespace skipped" >&2; return 0; }
+  local base_ns ns
+  base_ns=$(_env_value "$REPO/hmx/.env" HMX_INSTANCE_NAMESPACE)
+  ns=$(_db_name_for_branch "$branch")
+  [ -n "$base_ns" ] && ns="$base_ns-$ns"
+  python3 - "$env_file" "$ns" <<'PY'
+import sys
+path, name = sys.argv[1:3]
+with open(path) as fh:
+    lines = fh.read().splitlines()
+out, seen = [], False
+for line in lines:
+    if line.startswith("HMX_INSTANCE_NAMESPACE="):
+        out.append(f"HMX_INSTANCE_NAMESPACE={name}")
+        seen = True
+    else:
+        out.append(line)
+if not seen:
+    out.append(f"HMX_INSTANCE_NAMESPACE={name}")
+with open(path, "w") as fh:
+    fh.write("\n".join(out) + "\n")
+PY
+  echo "  .env:    HMX_INSTANCE_NAMESPACE = $ns"
+}
+
+# ── Per-branch Celery worker ──────────────────────────────────────
+_slug() { printf '%s' "$1" | tr '/' '_'; }
+
+_branch_root() { # django root for a branch (base lives in $REPO itself)
+  local branch="$1" tree
+  if [ "$branch" = "$BASE" ]; then tree="$REPO"; else tree="$WT_DIR/$branch"; fi
+  [ -d "$tree" ] || return 1
+  _find_django_root "$tree"
+}
+
+_celery_pidfile() { printf '%s/%s.pid' "$CELERY_STATE" "$(_slug "$1")"; }
+_celery_logfile() { printf '%s/%s-celery.log' "$LOGDIR" "$(_slug "$1")"; }
+
+_celery_pid() { # live worker pid for a branch; empty if none/dead/zombie
+  # ALWAYS returns 0. Callers do `pid=$(_celery_pid ...)` under `set -e`, where a
+  # non-zero status from the substitution aborts the whole script.
+  local pf pid state
+  pf=$(_celery_pidfile "$1")
+  [ -s "$pf" ] || return 0
+  pid=$(head -1 "$pf" 2>/dev/null || true)
+  [ -n "$pid" ] || return 0
+  # kill -0 also succeeds for a ZOMBIE, which is how a worker that died during
+  # startup got reported as "up". Check the real process state too.
+  kill -0 "$pid" 2>/dev/null || return 0
+  state=$(sed 's/^.*) //' "/proc/$pid/stat" 2>/dev/null | cut -d' ' -f1)
+  [ "$state" = "Z" ] && return 0
+  printf '%s' "$pid"
+  return 0
+}
+
+_celery_namespace() { # namespace a branch's .env resolves to (empty if unknown)
+  local branch="$1" env_file
+  if [ "$branch" = "$BASE" ]; then env_file="$REPO/hmx/.env"; else env_file="$WT_DIR/$branch/hmx/.env"; fi
+  [ -f "$env_file" ] && _env_value "$env_file" HMX_INSTANCE_NAMESPACE
+}
+
+_celery_ready() { # has the worker announced readiness in its log?
+  # Celery prints "<hostname> ready." once the app is fully loaded. Process
+  # liveness alone is NOT readiness: an HMX worker spends ~15-30s importing
+  # modules, and a worker started with bad args stays alive for seconds before
+  # its CLI validation kills it — liveness alone reported those as "up".
+  local log
+  log=$(_celery_logfile "$1")
+  [ -f "$log" ] && grep -q ' ready\.' "$log"
+}
+
+_celery_start() { # start the branch's worker (idempotent)
+  # $2 = 1 to block until the worker is ready (the explicit `dcw celery start`),
+  # 0/unset to only confirm it survived startup (the `dcw start` path, which must
+  # stay fast — the worker keeps loading in the background).
+  # Returns non-zero only when a worker was requested and did not come up, so the
+  # explicit command can fail loudly. Callers on the `dcw start` path append
+  # `|| true`: the server is the primary artifact and a worker problem must not
+  # make `dcw start` exit non-zero.
+  local branch="$1" wait="${2:-0}"
+  local pf log root existing celery_bin pid n budget
+  if [ "$CELERY_ENABLED" != 1 ]; then
+    echo "  celery:  skipped (DCW_CELERY=$CELERY_ENABLED)"
+    return 0
+  fi
+  pf=$(_celery_pidfile "$branch"); log=$(_celery_logfile "$branch")
+  existing=$(_celery_pid "$branch")
+  if [ -n "$existing" ]; then
+    echo "  celery:  already running (pid $existing)"
+    return 0
+  fi
+  root=$(_branch_root "$branch") || { echo "  celery:  django root not found; worker NOT started" >&2; return 1; }
+  celery_bin="$VENV/bin/celery"
+  if [ ! -x "$celery_bin" ]; then celery_bin=$(command -v celery 2>/dev/null || true); fi
+  [ -n "$celery_bin" ] || { echo "  celery:  celery binary not found; worker NOT started" >&2; return 1; }
+  (
+    cd "$root" || exit 1
+    # shellcheck disable=SC1091
+    [ -f "$VENV/bin/activate" ] && source "$VENV/bin/activate"
+    nohup "$celery_bin" -A hmx worker \
+      --loglevel="$CELERY_LOGLEVEL" \
+      --concurrency="$CELERY_CONCURRENCY" \
+      --hostname="dcw-$(_slug "$branch")@%h" \
+      -Q "$CELERY_QUEUES" > "$log" 2>&1 &
+    # pid + branch, so `celery status` can name the branch behind a slugged file
+    printf '%s\n%s\n' "$!" "$branch" > "$pf"
+  )
+  n=0
+  while [ "$n" -lt 20 ]; do          # up to 10s for the process to appear
+    pid=$(_celery_pid "$branch")
+    [ -n "$pid" ] && break
+    sleep 0.5; n=$((n+1))
+  done
+  if [ -z "$pid" ]; then
+    echo "  celery:  worker did NOT start (server is unaffected); last log lines:" >&2
+    tail -15 "$log" >&2 2>/dev/null || true
+    rm -f "$pf"
+    return 1
+  fi
+  budget=4                            # ~2s: catch a process that dies right away
+  [ "$wait" = 1 ] && budget=120       # ~60s: HMX module load takes 15-30s
+  n=0
+  while [ "$n" -lt "$budget" ]; do
+    pid=$(_celery_pid "$branch")
+    [ -z "$pid" ] && break            # died -> fail below
+    _celery_ready "$branch" && break
+    sleep 0.5; n=$((n+1))
+  done
+  pid=$(_celery_pid "$branch")
+  if [ -z "$pid" ]; then
+    echo "  celery:  worker did NOT start (server is unaffected); last log lines:" >&2
+    tail -15 "$log" >&2 2>/dev/null || true
+    rm -f "$pf"
+    return 1
+  fi
+  if _celery_ready "$branch"; then
+    echo "  celery:  worker up (pid $pid, ns $(_celery_namespace "$branch"))"
+    return 0
+  fi
+  if [ "$wait" = 1 ]; then
+    echo "  celery:  worker alive but never became ready (~60s); see $log" >&2
+    return 1
+  fi
+  echo "  celery:  worker starting (pid $pid, ns $(_celery_namespace "$branch"))"
+  echo "           HMX module load takes ~15-30s; watch: dcw logs $branch celery"
+  return 0
+}
+
+_celery_stop() { # stop the branch's worker (keeps the branch/worktree)
+  local branch="$1" pid n
+  pid=$(_celery_pid "$branch")
+  if [ -z "$pid" ]; then
+    rm -f "$(_celery_pidfile "$branch")"
+    echo "  celery:  not running"
+    return 0
+  fi
+  kill -TERM "$pid" 2>/dev/null || true
+  n=0
+  while kill -0 "$pid" 2>/dev/null && [ "$n" -lt 30 ]; do sleep 0.5; n=$((n+1)); done
+  kill -KILL "$pid" 2>/dev/null || true
+  rm -f "$(_celery_pidfile "$branch")"
+  echo "  celery:  stopped (pid $pid)"
+}
+
 _copy_private_paths() { # copy agent/config files repo -> worktree (once), git-exclude them
   local branch="$1"
   local wt="$WT_DIR/$branch"
@@ -372,6 +568,7 @@ case "$cmd" in
       if [ -n "$existing_pid" ]; then
         echo "✓ $branch already running (pid $existing_pid) on port $port"
         echo "  preview: http://127.0.0.1:$port"
+        _celery_start "$branch" || true
         exit 0
       fi
       log="$LOGDIR/main.log"
@@ -381,6 +578,7 @@ case "$cmd" in
       echo "  port:    $port  (pid $pid)"
       echo "  preview: http://127.0.0.1:$port"
       echo "  log:     $log"
+      _celery_start "$branch" || true
       exit 0
     fi
 
@@ -414,6 +612,7 @@ case "$cmd" in
     _db_clone "$branch"
     _set_worktree_db_json "$branch"
     _set_worktree_env_db "$branch"
+    _set_worktree_env_namespace "$branch"
 
     port=$(_port_alloc "$branch")
 
@@ -421,12 +620,14 @@ case "$cmd" in
     if [ -n "$existing_pid" ]; then
       echo "already running (pid $existing_pid)"
       echo "  preview: http://127.0.0.1:$port"
+      _celery_start "$branch" || true
       exit 0
     fi
 
-    log="$LOGDIR/$(echo "$branch" | tr '/' '_').log"
+    log="$LOGDIR/$(_slug "$branch").log"
     pid=$(_start_server "$wt" "$port" "$log") || {
       echo "⚠ worktree + port reserved; spawn manually when ready"
+      _celery_start "$branch" || true
       exit 0
     }
 
@@ -435,6 +636,7 @@ case "$cmd" in
     echo "  port:     $port  (pid $pid)"
     echo "  preview:  http://127.0.0.1:$port"
     echo "  log:      $log"
+    _celery_start "$branch" || true
     ;;
 
   stop)
@@ -445,35 +647,103 @@ case "$cmd" in
         port="$PORT_BASE"
       else
         echo "no captain running for $branch"
+        _celery_stop "$branch"
         exit 0
       fi
     fi
     _kill_port "$port"
+    _celery_stop "$branch"
     echo "✓ stopped $branch (port $port) — worktree/branch left intact"
     ;;
 
   status|ps)
-    if [ ! -f "$REG" ] || [ "$(cat "$REG")" = "{}" ]; then
-      echo "(no active captains)"
-      exit 0
-    fi
     python3 <<PYSTAT
-import json, os
-d = json.load(open("$REG"))
-print(f"{'PORT':<7}{'BRANCH':<40}{'PID':<10}{'STATUS':<10}URL")
+import json, os, subprocess
+try:
+    d = json.load(open("$REG"))
+except Exception:
+    d = {}
+cel_dir = "$CELERY_STATE"
+cel_log = "$LOGDIR"
+
+def proc_state(pid):
+    # 'Z' matters: kill -0 (and os.kill(pid, 0)) succeeds for a zombie, so a
+    # process that died during startup would otherwise read as alive.
+    try:
+        return open(f"/proc/{pid}/stat").read().rsplit(") ", 1)[1].split(" ", 1)[0]
+    except Exception:
+        return None
+
+def listener(port):
+    try:
+        r = subprocess.run(["lsof", "-tiTCP:%s" % port, "-sTCP:LISTEN"],
+                           capture_output=True, text=True, timeout=5)
+        return bool(r.stdout.strip())
+    except Exception:
+        return False
+
+def celery_state(branch):
+    pf = os.path.join(cel_dir, branch.replace("/", "_") + ".pid")
+    try:
+        pid = int(open(pf).read().split()[0])
+    except Exception:
+        return "-"
+    state = proc_state(pid)
+    if state is None or state == "Z":
+        return "dead"
+    log = os.path.join(cel_log, branch.replace("/", "_") + "-celery.log")
+    try:
+        with open(log, "rb") as fh:
+            return "ready" if b" ready." in fh.read(4_000_000) else "starting"
+    except Exception:
+        return "starting"
+
+rows = []
 for port, info in sorted(d.items(), key=lambda x: int(x[0])):
     if isinstance(info, dict):
-        branch = info.get("branch","?")
-        pid = info.get("pid", 0)
+        branch = info.get("branch", "?")
+        pid = info.get("pid", 0) or 0
     else:
         branch, pid = info, 0
-    alive = False
-    if pid:
-        try: os.kill(int(pid), 0); alive = True
-        except: pass
-    status = "up" if alive else ("reserved" if pid == 0 else "dead")
-    url = f"http://127.0.0.1:{port}"
-    print(f"{port:<7}{branch:<40}{str(pid):<10}{status:<10}{url}")
+    state = proc_state(pid) if pid else None
+    if state is not None and state != "Z":
+        status = "up"
+    elif listener(port):
+        status = "up"            # something serves the port even if no pid is recorded
+    elif pid == 0:
+        # dcw stop leaves a pid=0 tombstone for the base branch so its port stays
+        # reserved. Nothing is listening, so it is NOT an active captain — and it
+        # is permanent after the first base start, so it must not be noise.
+        status = "reserved"
+    else:
+        status = "dead"
+    rows.append((port, branch, pid, status))
+
+workers = []
+if os.path.isdir(cel_dir):
+    for name in sorted(os.listdir(cel_dir)):
+        if not name.endswith(".pid"):
+            continue
+        try:
+            parts = open(os.path.join(cel_dir, name)).read().split()
+            b = parts[1] if len(parts) > 1 else name[:-4]
+        except Exception:
+            continue
+        st = celery_state(b)
+        if st in ("ready", "starting"):
+            workers.append((b, st))
+
+shown = [r for r in rows if r[3] in ("up", "dead")]
+if not shown and not workers:
+    print("(no active captains)")
+else:
+    print(f"{'PORT':<7}{'BRANCH':<40}{'PID':<10}{'STATUS':<10}{'CELERY':<10}URL")
+    for port, branch, pid, status in shown:
+        url = f"http://127.0.0.1:{port}"
+        print(f"{port:<7}{branch:<40}{str(pid):<10}{status:<10}{celery_state(branch):<10}{url}")
+    for b, st in workers:
+        if not any(r[1] == b for r in shown):
+            print(f"{'-':<7}{b:<40}{'-':<10}{'worker only':<12}{st:<10}(no server)")
 PYSTAT
     ;;
 
@@ -532,18 +802,96 @@ PYLIST
       _kill_port "$port"
       _port_free "$port"
     fi
+    _celery_stop "$branch"
     [ -d "$wt" ] && git -C "$REPO" worktree remove --force "$wt"
     git -C "$REPO" branch -D "$branch" 2>/dev/null || true
     _db_drop "$branch"
     echo "✓ aborted $branch"
     ;;
 
+  celery)
+    sub="${1:-status}"; shift || true
+    case "$sub" in
+      start|restart)
+        branch="${1:-$BASE}"
+        [ "$sub" = restart ] && _celery_stop "$branch"
+        # explicit request -> block until the worker is ready (or fail loudly)
+        _celery_start "$branch" 1 || exit 1
+        ;;
+      stop)
+        branch="${1:-$BASE}"
+        _celery_stop "$branch"
+        ;;
+      status)
+        python3 - "$CELERY_STATE" "$LOGDIR" "$REPO" "$WT_DIR" "$BASE" <<'PYCEL'
+import os, sys
+cel_dir, log_dir, repo, wt_dir, base = sys.argv[1:6]
+
+def namespace_of(branch):
+    env_file = (os.path.join(repo, "hmx", ".env") if branch == base
+                else os.path.join(wt_dir, branch, "hmx", ".env"))
+    try:
+        for line in open(env_file):
+            if line.startswith("HMX_INSTANCE_NAMESPACE="):
+                return line.split("=", 1)[1].strip()
+    except Exception:
+        pass
+    return "-"
+
+def proc_state(pid):
+    # 'Z' matters: kill -0 succeeds for a zombie, so a worker that died during
+    # startup would otherwise read as alive.
+    try:
+        with open(f"/proc/{pid}/stat") as fh:
+            return fh.read().rsplit(") ", 1)[1].split(" ", 1)[0]
+    except Exception:
+        return None
+
+rows = []
+if os.path.isdir(cel_dir):
+    for name in sorted(os.listdir(cel_dir)):
+        if not name.endswith(".pid"):
+            continue
+        try:
+            parts = open(os.path.join(cel_dir, name)).read().split()
+            pid = int(parts[0])
+            branch = parts[1] if len(parts) > 1 else name[:-4]
+        except Exception:
+            continue
+        state = proc_state(pid)
+        if state is None or state == "Z":
+            status = "dead"
+        else:
+            log = os.path.join(log_dir, branch.replace("/", "_") + "-celery.log")
+            try:
+                with open(log, "rb") as fh:
+                    status = "ready" if b" ready." in fh.read(4_000_000) else "starting"
+            except Exception:
+                status = "starting"
+        rows.append((branch, pid, status, namespace_of(branch)))
+
+if not rows:
+    print("(no celery workers)")
+else:
+    print(f"{'BRANCH':<28}{'PID':<10}{'STATUS':<10}{'NS':<44}LOG")
+    for branch, pid, status, ns in rows:
+        log = os.path.join(log_dir, branch.replace("/", "_") + "-celery.log")
+        print(f"{branch:<28}{pid:<10}{status:<10}{ns:<44}{log}")
+PYCEL
+        ;;
+      *) echo "usage: dcw celery <start|stop|restart|status> [branch]" >&2; exit 2 ;;
+    esac
+    ;;
+
   logs)
-    branch="${1:?usage: dcw logs <branch>}"
-    if [ "$branch" = "$BASE" ]; then
+    branch="${1:?usage: dcw logs <branch> [celery]}"
+    target="${2:-server}"
+    if [ "$target" = "celery" ]; then
+      log=$(_celery_logfile "$branch")
+    elif [ "$branch" = "$BASE" ]; then
       log="$LOGDIR/main.log"
     else
-      log="$LOGDIR/$(echo "$branch" | tr '/' '_').log"
+      log="$LOGDIR/$(_slug "$branch").log"
     fi
     [ -f "$log" ] || { echo "no log at $log" >&2; exit 2; }
     exec tail -f "$log"
@@ -551,30 +899,58 @@ PYLIST
 
   *)
     cat <<HELP
-dcw (local) — worktree + port + Django server lifecycle for $REPO
+dcw (local) — worktree + port + Django server + Celery lifecycle for $REPO
 
 Usage:
-  dcw start <branch>      Create worktree, clone DB (hmxmain → per-branch DB),
-                                  copy private files (.agents/.claude/AGENTS.md/.env/db.json),
-                                  point worktree .env + db.json at its own DB, start server
-                                  If <branch> == $BASE (base), runs in $REPO on port $PORT_BASE
-  dcw stop <branch>       Stop server for a branch; keeps worktree + branch
-  dcw status              List active captains with URLs + alive-state
+  dcw start <branch>      Create worktree, clone DB, copy private files, point the
+                          worktree .env at its own DB + Redis namespace, then start
+                          the server and a per-branch Celery worker.
+                          If <branch> == $BASE (base), runs in $REPO on port $PORT_BASE
+  dcw stop <branch>       Stop server + worker for a branch; keeps worktree + branch
+  dcw status              List active captains (port, pid, alive, celery) + URLs
   dcw list                Show all git worktrees (branch, port, dir)
-  dcw abort <branch>      Stop server → destroy worktree → free port → DROP worktree DB
-  dcw logs <branch>       Tail the server log
+  dcw abort <branch>      Stop server + worker → destroy worktree → free port → DROP DB
+  dcw logs <branch> [celery]
+                          Tail the server log (default) or the branch's worker log
+
+  dcw celery start|restart|stop [branch]
+                          Start/restart/stop a branch's worker (default branch: $BASE)
+  dcw celery status       Every worker with pid, alive state, Redis namespace, log
+
+Per-branch isolation:
+  Each worktree gets its own HMX_INSTANCE_NAMESPACE, and HMX derives every Redis
+  key from it — hmx:<sha256(ns)>:celery: (broker + results), :cache, :celery-healthcheck.
+  So branches share Redis DB indexes but never see each other's queues, results,
+  cache or realtime events. Web and worker of a branch agree because both read the
+  worktree .env.
+
+Celery notes:
+  - Worker queue set: $CELERY_QUEUES
+  - 'dcw start' does NOT block on the worker: it reports "worker starting" and the
+    worker keeps loading for ~15-30s (HMX imports the whole module registry).
+    'dcw celery start' waits for readiness and fails if it never arrives.
+    'dcw status' / 'dcw celery status' show ready vs starting vs dead.
+  - Beat is NOT started per branch (multiple beats would double-fire schedules);
+    use /opt/dev-tools/hmx-celery start beat for the base branch.
+  - The base branch's worker is independent of hmx-celery; running both just means
+    two workers on the base namespace.
 
 State:
   Port registry:  $REG
   Logs:           $LOGDIR/
+  Worker pidfiles:$CELERY_STATE/<branch>.pid
   Worktrees:      $WT_DIR/<branch>
   Ports range:    $PORT_BASE (base: $BASE) + $((PORT_BASE+1))-$((PORT_MAX-1)) (worktrees)
 
 Env overrides:
   DEV_CAPTAIN_REPO   repo root      (default: \$HOME/dev/hmx-002)
   DEV_CAPTAIN_VENV   venv path      (default: \$HOME/dev/.venv)
-  PORT_BASE          base port      (default: 5201)
+  PORT_BASE          base port      (default: 5200)
   PORT_MAX           max port       (default: 5220)
+  DCW_CELERY         1 = start a worker per branch, 0 = never (default: 1)
+  DCW_CELERY_QUEUES  worker -Q list (default: $CELERY_QUEUES)
+  DCW_CELERY_CONCURRENCY  worker --concurrency (default: $CELERY_CONCURRENCY)
+  DCW_CELERY_LOGLEVEL     worker --loglevel    (default: $CELERY_LOGLEVEL)
 HELP
     ;;
 esac
