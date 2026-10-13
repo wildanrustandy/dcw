@@ -12,6 +12,8 @@
 #   dcw stop <branch>    stop server + worker; leaves worktree/branch alone
 #   dcw status           list all captains (port, pid, alive, celery) + URLs
 #   dcw list             show all git worktrees (branch, port, dir)
+#   dcw path <branch>    print the worktree dir for a branch (base branch -> $REPO)
+#                        used by the shell wrapper to cd after `dcw start`
 #   dcw abort <branch>   destroy worktree + server + worker + worktree DB (no merge)
 #   dcw logs <branch> [celery]
 #                        tail the server log, or the branch's worker log
@@ -785,6 +787,17 @@ for block in blocks:
 PYLIST
     ;;
 
+  path|dir)
+    # Print the directory a branch lives in. Existence is NOT checked: the shell
+    # wrapper asks for this before `dcw start` creates the worktree.
+    branch="${1:?usage: dcw path <branch>}"
+    if [ "$branch" = "$BASE" ]; then
+      printf '%s\n' "$REPO"
+    else
+      printf '%s\n' "$WT_DIR/$branch"
+    fi
+    ;;
+
   abort)
     branch="${1:?usage: dcw abort <branch>}"
     if [ "$branch" = "$BASE" ]; then
@@ -909,6 +922,8 @@ Usage:
   dcw stop <branch>       Stop server + worker for a branch; keeps worktree + branch
   dcw status              List active captains (port, pid, alive, celery) + URLs
   dcw list                Show all git worktrees (branch, port, dir)
+  dcw path <branch>       Print the dir of a branch (base -> $REPO; worktree -> $WT_DIR/<branch>)
+                          Used by the shell function below to cd after 'dcw start'
   dcw abort <branch>      Stop server + worker → destroy worktree → free port → DROP DB
   dcw logs <branch> [celery]
                           Tail the server log (default) or the branch's worker log
@@ -934,6 +949,13 @@ Celery notes:
     use /opt/dev-tools/hmx-celery start beat for the base branch.
   - The base branch's worker is independent of hmx-celery; running both just means
     two workers on the base namespace.
+
+Shell integration:
+  'dcw' is installed as a shell FUNCTION (zsh/bash rc file) that calls the binary
+  and, for 'dcw start', cds into the worktree that was just created. A child
+  process cannot change its parent shell's directory, so this has to be a
+  function. Override the binary it calls with DCW_BIN; bypass the function with
+  'command dcw ...'. Re-run install.sh to refresh it.
 
 State:
   Port registry:  $REG

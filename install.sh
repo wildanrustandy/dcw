@@ -88,10 +88,12 @@ _rc_candidates_for() { # rc files to try, in order, for a given shell
   esac
 }
 
-_login_path() { # PATH a fresh login shell gets; empty if it cannot be asked
-  local sh="$1" tmp pid n=0 raw
-  tmp=$(mktemp 2>/dev/null || printf '%s' "$HOME/.dcw.loginpath.$$")
-  ( "$sh" -lic 'printf "\n__DCW_PATH__%s\n" "$PATH"' >"$tmp" 2>/dev/null ) &
+_ask_login_shell() { # run CMD in the login shell; echo its stdout (empty if unqueryable)
+  # The marker survives rc-file noise (banners, plugin output) on stdout: keep
+  # everything after the LAST marker, up to the end of that line.
+  local sh="$1" marker="$2" cmd="$3" tmp pid n=0 raw
+  tmp=$(mktemp 2>/dev/null || printf '%s' "$HOME/.dcw.ask.$$")
+  ( "$sh" -lic "printf '\\n$marker%s\\n' \"\$($cmd)\"" >"$tmp" 2>/dev/null ) &
   pid=$!
   # An rc file can hang (waiting on input, network, a sleeping hook). Poll, then
   # SIGKILL: an INTERACTIVE shell ignores SIGTERM, so TERM alone would let
@@ -104,11 +106,20 @@ _login_path() { # PATH a fresh login shell gets; empty if it cannot be asked
   raw=$(cat "$tmp" 2>/dev/null || true)
   rm -f "$tmp"
   case "$raw" in
-    *__DCW_PATH__*) raw=${raw##*__DCW_PATH__}   # last marker: rc files may print too
-                    raw=${raw%%$'\n'*} ;;
-    *)              raw="" ;;                   # could not query the shell
+    *"$marker"*) raw=${raw##*"$marker"}   # last marker: rc files may print too
+                 raw=${raw%%$'\n'*} ;;
+    *)           raw="" ;;                # could not query the shell
   esac
   printf '%s' "$raw"
+}
+
+_login_path() { _ask_login_shell "$1" '__DCW_PATH__' 'printf "%s" "$PATH"'; }
+
+_login_shell_knows_dcw() { # is dcw a FUNCTION in a fresh login shell? (a binary is not enough)
+  case "$(_ask_login_shell "$1" '__DCW_FN__' 'type dcw 2>/dev/null')" in
+    *function*) return 0 ;;
+    *)           return 1 ;;
+  esac
 }
 
 INTERACTIVE=0
@@ -232,6 +243,68 @@ case ":$LOGIN_PATH:" in
     ;;
 esac
 
+# ── shell integration: `dcw start` also cds into the worktree ─────
+# Only the CALLING shell can change its own working directory, so this can never
+# live in the binary: it is a thin function that asks the binary for the target
+# dir ('dcw path <branch>') and cds there after `start`. Written to the same rc
+# file the PATH block targets, then verified the same way — by asking a fresh
+# login shell whether dcw really IS a function (the binary alone would pass a
+# `command -v` check, which is exactly the failure mode to catch).
+DCW_BIN="$BIN_DIR/dcw"
+INTEG_MARKER='# dcw shell integration (added by installer)'
+INTEG_NOTE="none ($(basename "$LOGIN_SHELL"): cd \"\$(dcw path <branch>)\" after start)"
+case "$(basename "$LOGIN_SHELL")" in
+  zsh|bash)
+    INTEG_NOTE="dcw function (cd after 'dcw start')"
+    INTEG_BODY=$(sed "s|@BIN@|$DCW_BIN|g" <<'INTEG'
+# A function, not the binary: a child process cannot change its parent shell's
+# directory, so `dcw start` could not cd anywhere without this. Every subcommand
+# other than `start` is passed straight through. Set DCW_BIN to point the
+# function at another dcw; `command dcw ...` bypasses it.
+dcw() {
+  local _dcw_bin="${DCW_BIN:-@BIN@}" _dcw_dir _dcw_rc
+  if [ "${1:-}" = start ] && [ -n "${2:-}" ]; then
+    _dcw_dir=$("$_dcw_bin" path "$2" 2>/dev/null) || _dcw_dir=""
+    "$_dcw_bin" "$@"; _dcw_rc=$?
+    [ -n "$_dcw_dir" ] && [ -d "$_dcw_dir" ] && cd "$_dcw_dir"
+    return "$_dcw_rc"
+  fi
+  "$_dcw_bin" "$@"
+}
+INTEG
+)
+    VERIFIED_FN=0
+    for SHELL_RC in $(_rc_candidates_for "$LOGIN_SHELL"); do
+      mkdir -p "$(dirname "$SHELL_RC")"
+      if [ -f "$SHELL_RC" ] && grep -Fq "$INTEG_MARKER" "$SHELL_RC"; then
+        if grep -Fq "DCW_BIN:-$DCW_BIN}" "$SHELL_RC"; then
+          echo "✓ shell:    dcw function already declared in $SHELL_RC"
+        else
+          echo "⚠ shell:    $SHELL_RC has a dcw function pointing at another binary"
+          echo "            remove the '$INTEG_MARKER' block and re-run to use $DCW_BIN"
+          break
+        fi
+      else
+        printf '\n%s\n%s\n' "$INTEG_MARKER" "$INTEG_BODY" >> "$SHELL_RC"
+        echo "✓ shell:    dcw function added to $SHELL_RC"
+      fi
+      [ "$ASKED" = 1 ] || break
+      if _login_shell_knows_dcw "$LOGIN_SHELL"; then
+        echo "  ✓ verified: $LOGIN_SHELL loads dcw as a function"
+        VERIFIED_FN=1; break
+      fi
+    done
+    if [ "$ASKED" = 0 ]; then
+      echo "  ⚠ could not query $LOGIN_SHELL — open a new terminal to confirm"
+    elif [ "$VERIFIED_FN" = 0 ]; then
+      echo "  ⚠ unverified: dcw is not a function in $LOGIN_SHELL"
+    fi
+    ;;
+  *)
+    echo "⚠ shell:    no integration for $(basename "$LOGIN_SHELL") — cd \"\$(dcw path <branch>)\" after start"
+    ;;
+esac
+
 # ── summary ───────────────────────────────────────────────────────
 echo ""
 echo "== summary =="
@@ -239,7 +312,8 @@ echo "  bin:        $BIN_DIR"
 echo "  repo:       $REPO_PATH"
 echo "  venv:       $VENV_PATH"
 echo "  ports:      $PORT_BASE-$PORT_MAX"
+echo "  shell:      $INTEG_NOTE"
 echo ""
-echo "Usage: dcw start <branch> | status | list | logs <b> | stop <b> | abort <b>"
+echo "Usage: dcw start <branch> | status | list | path <b> | logs <b> | stop <b> | abort <b>"
 [ "$WARN" = 1 ] && echo "(review the warnings above)"
 exit 0

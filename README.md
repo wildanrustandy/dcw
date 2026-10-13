@@ -61,9 +61,38 @@ Prioritas konfigurasi: **env variable per-call** > **config file** > *default ba
 Installer juga mengecek dependency (`git`, `python3`, `lsof`, PostgreSQL client tools)
 dan memvalidasi path repo/venv yang dimasukkan.
 
-Perubahan `install.sh` sebaiknya diverifikasi dengan `./test-install.sh` (27 asersi:
-deteksi shell login, penulisan PATH, idempotensi, anti-hang). Pakai
-`SKIP_LIVE=1 ./test-install.sh` untuk melewati asersi instalasi di host ini.
+Perubahan `install.sh` sebaiknya diverifikasi dengan `./test-install.sh` (48 asersi:
+deteksi shell login, penulisan PATH, integrasi fungsi shell, idempotensi, anti-hang).
+Pakai `SKIP_LIVE=1 ./test-install.sh` untuk melewati asersi instalasi di host ini
+(group 10).
+
+### Integrasi shell: `dcw start` langsung pindah ke worktree
+
+Setelah `dcw start <branch>` selesai, shell Anda otomatis `cd` ke worktree branch itu:
+
+```sh
+~/repo $ dcw start mybranch
+✓ captain started: mybranch
+  worktree: /home/you/repo/.worktrees/mybranch
+~/repo/.worktrees/mybranch $        # ← sudah di dalam worktree
+```
+
+Ini **tidak bisa** dikerjakan binary-nya: proses anak tidak dapat mengubah working
+directory shell pemanggilnya. Karena itu installer menulis **fungsi shell** tipis ke
+file rc yang sama dengan blok PATH (zsh/bash):
+
+- Hanya `start <branch>` yang menambah `cd`; semua subcommand lain diteruskan apa adanya.
+- Target `cd` didapat dari subcommand baru `dcw path <branch>` — berguna manual juga:
+  `cd "$(dcw path mybranch)"`.
+- `cd` hanya terjadi kalau direktorinya benar-benar ada, dan exit code `dcw start`
+  diteruskan apa adanya.
+- `DCW_BIN=/path/lain/dcw` mengarahkan fungsi ke binary lain; `command dcw ...`
+  melewati fungsi dan memanggil binary langsung.
+- Shell login selain zsh/bash (mis. fish) belum dapat integrasi ini — installer hanya
+  memberi peringatan, dan Anda `cd "$(dcw path <branch>)"` sendiri.
+- Blok fungsi ditulis sekali (idempoten). Kalau Anda pindah `--bin`, installer akan
+  memperingatkan bahwa blok lama masih menunjuk binary lain — hapus blok
+  `# dcw shell integration (added by installer)` lalu jalankan installer lagi.
 
 ### Prasyarat
 
@@ -86,8 +115,10 @@ atau edit `~/.config/dcw/config`.
 ```sh
 dcw start <branch>    # buat worktree + clone DB + salin file privat + namespace Redis
                       # + jalankan server + worker Celery branch itu
+                      # → shell otomatis cd ke worktree (lihat "Integrasi shell")
 dcw status            # daftar captain aktif (port, pid, hidup/mati, celery)
 dcw list              # daftar semua git worktree
+dcw path <branch>     # cetak direktori branch (base → repo utama, lain → .worktrees/<branch>)
 dcw logs <branch> [celery]   # tail log server, atau log worker branch itu
 dcw stop <branch>     # stop server + worker (worktree + DB tetap)
 dcw abort <branch>    # hapus worktree + stop server/worker + DROP DB branch (konfirmasi)
