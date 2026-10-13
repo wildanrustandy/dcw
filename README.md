@@ -179,10 +179,12 @@ dcw start wildantest
 #   db:       cloning hmxmain -> wildantest
 #   celery:  worker up (pid 12345, ns wildan2-hmx-local-wildantest)
 
-dcw start Inventory   # base branch → langsung di repo utama, port 5200
+dcw start <base-branch>   # base branch → langsung di repo utama, port 5200
 ```
 
-Base branch dideteksi dari branch yang aktif di repo (fallback `origin/HEAD`).
+Base branch dideteksi dari `origin/HEAD` (branch default yang dideklarasikan repo,
+sama seperti `dev-captain`); fallback ke branch yang sedang aktif di repo, lalu `main`.
+Untuk memaksa: `DEV_CAPTAIN_BASE=<branch> dcw start <branch>`.
 
 ## Celery per branch
 

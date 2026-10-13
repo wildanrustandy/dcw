@@ -8,7 +8,9 @@
 #                        worktree .env at its own DB + Redis namespace, then start
 #                        the server and a per-branch Celery worker.
 #                        if <branch> == base branch, runs in $REPO on $PORT_BASE
-#                        (no worktree — main IS $REPO)
+#                        (no worktree — the base branch IS $REPO)
+#                        base branch = origin/HEAD, else the branch checked out in
+#                        $REPO, else main; override with DEV_CAPTAIN_BASE
 #   dcw stop <branch>    stop server + worker; leaves worktree/branch alone
 #   dcw status           list all captains (port, pid, alive, celery) + URLs
 #   dcw list             show all git worktrees (branch, port, dir)
@@ -58,12 +60,15 @@ LOCK="$STATE/.lock"
 CELERY_STATE="$STATE/celery"
 mkdir -p "$LOGDIR" "$CELERY_STATE"
 
-# Base branch detection — prefer the branch currently checked out in $REPO
-# (it matches the shared DB's module state), fallback to origin/HEAD, then main
-if [ -d "$REPO/.git" ]; then
-  BASE=$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
-  if [ -z "$BASE" ] || [ "$BASE" = "HEAD" ]; then
-    BASE=$(git -C "$REPO" rev-parse --abbrev-ref origin/HEAD 2>/dev/null | sed "s|^origin/||" || true)
+# Base branch detection — from origin/HEAD (the branch the repo declares as its
+# default), like DevSpace dev-captain. Fallback: the branch currently checked out
+# in $REPO, then main. Override with DEV_CAPTAIN_BASE.
+BASE="${DEV_CAPTAIN_BASE:-}"
+if [ -z "$BASE" ] && [ -d "$REPO/.git" ]; then
+  BASE=$(git -C "$REPO" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null | sed 's|^origin/||' || true)
+  if [ -z "$BASE" ]; then
+    BASE=$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+    if [ "$BASE" = "HEAD" ]; then BASE=""; fi
   fi
 fi
 BASE="${BASE:-main}"
@@ -564,8 +569,16 @@ case "$cmd" in
     [ -d "$REPO/.git" ] || { echo "error: $REPO is not a git repo — clone first" >&2; exit 2; }
 
     if [ "$branch" = "$BASE" ]; then
-      # ── BASE BRANCH FAST PATH — no worktree, $REPO on PORT_BASE ──
+      # ── BASE BRANCH FAST PATH — no worktree, $REPO on $PORT_BASE ──
       port="$PORT_BASE"
+      # $REPO serves whatever branch it has checked out. With BASE read from
+      # origin/HEAD those can differ, so say so instead of silently labelling the
+      # running code as $BASE.
+      repo_head=$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || true)
+      if [ -n "$repo_head" ] && [ "$repo_head" != "$BASE" ]; then
+        echo "warning: $REPO has '$repo_head' checked out, not $BASE — this server runs $repo_head." >&2
+        echo "         run 'git -C $REPO switch $BASE' to serve $BASE." >&2
+      fi
       existing_pid=$(_pid_for_port "$port")
       if [ -n "$existing_pid" ]; then
         echo "✓ $branch already running (pid $existing_pid) on port $port"
@@ -586,6 +599,14 @@ case "$cmd" in
 
     # ── WORKTREE PATH ──
     wt="$WT_DIR/$branch"
+    # git refuses to add a worktree for a branch that $REPO already has checked
+    # out. Reachable now that BASE comes from origin/HEAD: e.g. `dcw start <branch
+    # checked out in $REPO>` while origin/HEAD points at a different branch.
+    if [ "$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || true)" = "$branch" ]; then
+      echo "error: $branch is checked out in $REPO — git cannot add it as a worktree." >&2
+      echo "       switch $REPO to $BASE, or set DEV_CAPTAIN_BASE=$branch if that is your base branch." >&2
+      exit 2
+    fi
     if [ ! -d "$wt" ]; then
       cd "$REPO"
       if ! git fetch origin 2>&1 | tail -3; then
