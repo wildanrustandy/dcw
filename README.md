@@ -94,6 +94,48 @@ file rc yang sama dengan blok PATH (zsh/bash):
   memperingatkan bahwa blok lama masih menunjuk binary lain — hapus blok
   `# dcw shell integration (added by installer)` lalu jalankan installer lagi.
 
+### Helper venv: `venvhmx` dan `venvhere`
+
+Installer juga memasang dua fungsi venv dari `shell/venv.sh` di repo (disalin ke
+`~/.config/dcw/shell/venv.sh`, lalu di-`source` dari file rc yang sama):
+
+| Fungsi | Efek |
+|---|---|
+| `venvhmx` | activate venv project **dan** `cd` ke folder project |
+| `venvhere` | activate venv **tanpa** pindah direktori — tetap di tempat Anda sekarang |
+
+`venvhere` dipasangkan dengan `dcw start`: setelah `dcw start <branch>` Anda sudah
+berada di worktree, lalu `venvhere` mengaktifkan venv tanpa memindahkan Anda lagi:
+
+```sh
+~/repo $ dcw start mybranch
+✓ captain started: mybranch
+~/repo/.worktrees/mybranch $ venvhere
+venvhere: aktif -> Python 3.14.4 @ /home/you/repo/.worktrees/mybranch
+```
+
+Urutan pencarian venv `venvhere`: argumen (`venvhere /path/venv`) → `.venv` di
+direktori sekarang → `.venv` di root git/worktree → venv dari config dcw
+(`DEV_CAPTAIN_VENV`, default `~/.venv`). Venv yang sedang aktif dilepas dulu
+supaya PATH tidak menumpuk; path yang salah → pesan error + exit 1.
+
+`venvhmx` dan `venvhere` membaca `~/.config/dcw/config`, jadi keduanya mengikuti
+`DEV_CAPTAIN_REPO` / `DEV_CAPTAIN_VENV` — pindah project cukup ubah config, tidak
+ada path yang di-hardcode di dotfile.
+
+Karena keduanya berasal dari repo, Anda tidak perlu menaruh definisinya manual di
+`~/.zshrc` lagi. Kalau masih ada blok manual lama, sebaiknya dihapus: `~/.zshenv`
+dibaca sebelum `~/.zshrc`, jadi definisi manual yang lama akan **menang** dan
+versi repo tidak terpakai.
+
+Selain itu, installer juga menambahkan baris `source` ke file rc (marker
+`# dcw venv helpers (added by installer)`), jadi cukup `install.sh` sekali.
+
+Memperbarui: jalankan `install.sh` lagi. File `~/.config/dcw/shell/venv.sh`
+ditimpa dengan versi repo, jadi fungsi ikut ter-update tanpa mengubah rc file.
+`uninstall.sh` menghapus binary, `~/.config/dcw`, dan ketiga blok rc (dengan
+backup `<rc>.dcw-uninstall.bak`).
+
 ### Prasyarat
 
 1. **Repo HMX** ada di `~/dev/hmx-002` (default; bisa di-override)

@@ -53,6 +53,7 @@ done
 
 SRC="$(cd "$(dirname "$0")" && pwd)/dcw"
 [ -f "$SRC" ] || { echo "error: dcw script not found next to install.sh" >&2; exit 1; }
+SHELL_SRC="$(cd "$(dirname "$0")" && pwd)/shell/venv.sh"   # venvhmx / venvhere
 
 # ── shell / PATH detection ────────────────────────────────────────
 # $SHELL lies on a no-root host: /etc/passwd still says /bin/bash (chsh needs
@@ -115,11 +116,19 @@ _ask_login_shell() { # run CMD in the login shell; echo its stdout (empty if unq
 
 _login_path() { _ask_login_shell "$1" '__DCW_PATH__' 'printf "%s" "$PATH"'; }
 
-_login_shell_knows_dcw() { # is dcw a FUNCTION in a fresh login shell? (a binary is not enough)
-  case "$(_ask_login_shell "$1" '__DCW_FN__' 'type dcw 2>/dev/null')" in
+_login_shell_has_function() { # is NAME a shell function in a fresh login shell?
+  # There is no portable type flag: zsh has `whence -w`, bash has `type -t` (and
+  # zsh's `type -t` silently fails). Plain `type NAME` works in both and says
+  # "NAME is a shell function from <file>" (zsh) / "NAME is a function" (bash),
+  # while a binary answers "NAME is /path/NAME". So match the word.
+  case "$(_ask_login_shell "$1" '__DCW_FN__' "type $2 2>/dev/null")" in
     *function*) return 0 ;;
     *)           return 1 ;;
   esac
+}
+
+_login_shell_knows_dcw() { # a BINARY would answer "is /path/dcw" — not enough
+  _login_shell_has_function "$1" dcw
 }
 
 INTERACTIVE=0
@@ -208,6 +217,19 @@ cat > "$CONFIG_DIR/config" <<EOF
 : "\${PORT_MAX:=$PORT_MAX}"
 EOF
 echo "✓ config:   $CONFIG_DIR/config"
+
+# ── venv helpers (venvhmx / venvhere) ─────────────────────────────
+# Shipped as a file next to the config and sourced from the rc file (see the
+# shell-integration block below). A file rather than an inline block: re-running
+# the installer then refreshes the functions without touching the rc file again.
+VENV_DEST="$CONFIG_DIR/shell/venv.sh"
+if [ -f "$SHELL_SRC" ]; then
+  mkdir -p "$(dirname "$VENV_DEST")"
+  cp "$SHELL_SRC" "$VENV_DEST"
+  echo "✓ venv:     $VENV_DEST (venvhmx, venvhere)"
+else
+  echo "⚠ venv:     shell/venv.sh not found next to install.sh — venv helpers NOT installed"
+fi
 
 # ── PATH ──────────────────────────────────────────────────────────
 # Edit the rc files, then RE-ASK the login shell. A login bash does not read
@@ -299,6 +321,42 @@ INTEG
     elif [ "$VERIFIED_FN" = 0 ]; then
       echo "  ⚠ unverified: dcw is not a function in $LOGIN_SHELL"
     fi
+
+    # ── venv helpers: source the file installed above ──
+    # A second marker, checked independently: an older install already has the
+    # dcw function block and must still pick this up on a re-run. Paths are left
+    # as $HOME (not the resolved path) so the rc file stays portable.
+    VENV_MARKER='# dcw venv helpers (added by installer)'
+    VENV_BODY='# venvhmx: activate the project venv and cd into it.
+# venvhere: activate the venv for the CURRENT directory, staying put (so it
+# pairs with `dcw start <branch>`, which moves you into the worktree).
+[ -f "$HOME/.config/dcw/shell/venv.sh" ] && . "$HOME/.config/dcw/shell/venv.sh"'
+    if [ ! -f "$SHELL_SRC" ]; then
+      echo "  ⚠ venv:     no shell/venv.sh to install — venvhmx/venvhere skipped"
+    elif [ ! -f "$VENV_DEST" ]; then
+      echo "  ⚠ venv:     $VENV_DEST missing — venvhmx/venvhere skipped"
+    else
+      VERIFIED_VENV=0
+      for SHELL_RC in $(_rc_candidates_for "$LOGIN_SHELL"); do
+        mkdir -p "$(dirname "$SHELL_RC")"
+        if [ -f "$SHELL_RC" ] && grep -Fq "$VENV_MARKER" "$SHELL_RC"; then
+          echo "✓ venv:     already sourced in $SHELL_RC"
+        else
+          printf '\n%s\n%s\n' "$VENV_MARKER" "$VENV_BODY" >> "$SHELL_RC"
+          echo "✓ venv:     sourced in $SHELL_RC"
+        fi
+        [ "$ASKED" = 1 ] || break
+        if _login_shell_has_function "$LOGIN_SHELL" venvhere; then
+          echo "  ✓ verified: $LOGIN_SHELL loads venvhere + venvhmx"
+          VERIFIED_VENV=1; break
+        fi
+      done
+      if [ "$ASKED" = 0 ]; then
+        echo "  ⚠ could not query $LOGIN_SHELL — open a new terminal to confirm"
+      elif [ "$VERIFIED_VENV" = 0 ]; then
+        echo "  ⚠ unverified: venvhere is not a function in $LOGIN_SHELL"
+      fi
+    fi
     ;;
   *)
     echo "⚠ shell:    no integration for $(basename "$LOGIN_SHELL") — cd \"\$(dcw path <branch>)\" after start"
@@ -313,6 +371,9 @@ echo "  repo:       $REPO_PATH"
 echo "  venv:       $VENV_PATH"
 echo "  ports:      $PORT_BASE-$PORT_MAX"
 echo "  shell:      $INTEG_NOTE"
+if [ -f "$VENV_DEST" ]; then
+  echo "  venv fns:   venvhmx + venvhere ($VENV_DEST)"
+fi
 echo ""
 echo "Usage: dcw start <branch> | status | list | path <b> | logs <b> | stop <b> | abort <b>"
 [ "$WARN" = 1 ] && echo "(review the warnings above)"

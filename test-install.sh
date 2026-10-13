@@ -48,21 +48,23 @@ bash -n "$SRC" && ok "bash -n install.sh" || bad "bash -n install.sh"
 
 echo "== 1. zsh host: PATH lands in ~/.zshenv, verified against the shell =="
 A="$D/zsh"; zsh_host "$A"
-# Seed with a dcw-free copy of the real ~/.zshenv. It must drop the WHOLE shell
-# function block (marker + comments + body), not just the marker line: leaving a
-# stray function would make these sandboxes pass for the wrong reason.
-awk '
-  /dcw shell integration \(added by installer\)/ { skip = 1; next }
-  skip && /^}/                                  { skip = 0; next }
-  skip                                          { next }
-  /added by dcw installer/                      { next }
-  /^export PATH="/                             { next }
-  { print }
-' "$HOME/.zshenv" > "$A/.zshenv"
+# Seed ~/.zshenv with static content shaped like a user-local zsh setup — the
+# same shape this host has (ZSH_LOCAL, module_path, a guarded ~/.local/bin PATH
+# block), so the tests are hermetic: they must not depend on (or be fooled by)
+# whatever the installer previously wrote to THIS host's ~/.zshenv.
+printf '%s\n' \
+  '# --- user-local zsh (installed under ~/.local/zsh, no root needed) ---' \
+  'export ZSH_LOCAL="$HOME/.local/zsh"' \
+  'typeset -a module_path=( "$ZSH_LOCAL/lib/zsh/5.9" $module_path )' \
+  'case ":$PATH:" in' \
+  '  *":$HOME/.local/bin:"*) ;;' \
+  '  *) export PATH="$HOME/.local/bin:$PATH" ;;' \
+  'esac' > "$A/.zshenv"
 out=$(HOME="$A" bash "$SRC" --bin "$A/bin" "${INSTALL_ARGS[@]}" 2>&1)
 has "writes to ~/.zshenv" "$out" "added $A/bin to $A/.zshenv"
 has "verifies via login shell" "$out" "✓ verified"
 is  "rc block appended once" "$(grep -c 'added by dcw installer' "$A/.zshenv")" "1"
+has "pre-existing .zshenv content kept" "$(cat "$A/.zshenv")" "module_path"
 # dcw is a FUNCTION now, so `command -v dcw` prints "dcw" — assert the function
 # loaded (whence -w) and, separately, that the PATH edit really took effect.
 is  "fresh zsh loads dcw as a function" "$(HOME="$A" "$ZSH_BIN" -lic 'whence -w dcw' 2>/dev/null)" "dcw: function"
@@ -157,10 +159,70 @@ has "summary reports none" "$out" "shell:      none"
 fish_fn=$(grep -c 'dcw shell integration' "$FS/.config/fish/config.fish" 2>/dev/null || true)
 is  "no function block written" "${fish_fn:-0}" "0"
 
+echo "== 10. venv helpers (venvhmx / venvhere) installed and working =="
+# A sandbox with a fake project + fake venvs, so the assertions do not depend on
+# this host's ~/repo or ~/.venv. venv.sh is sourced from the rc file, so the
+# functions must exist in a fresh login shell without any manual .zshrc edit.
+V="$D/venvs"; zsh_host "$V"
+FAKE_REPO="$V/proj"; FAKE_VENV="$V/venv-cfg"
+mkfake_venv() {
+  mkdir -p "$1/bin"
+  cat > "$1/bin/activate" <<EOF
+export VIRTUAL_ENV="$1"
+export PATH="\$VIRTUAL_ENV/bin:\$PATH"
+deactivate() { PATH="\${PATH#\$VIRTUAL_ENV/bin:}"; unset VIRTUAL_ENV; unset -f deactivate; }
+EOF
+}
+mkfake_venv "$FAKE_VENV"
+mkfake_venv "$FAKE_REPO/.venv"
+mkdir -p "$FAKE_REPO/hmx"
+( cd "$FAKE_REPO" && git init -q . )
+out=$(HOME="$V" bash "$SRC" --bin "$V/.local/bin" --repo "$FAKE_REPO" --venv "$FAKE_VENV" \
+      --port-base 4200 --port-max 4215 --yes 2>&1)
+has "installs the venv helper file" "$out" "venv.sh (venvhmx, venvhere)"
+is  "helper file present"  "$([ -f "$V/.config/dcw/shell/venv.sh" ] && echo yes)" "yes"
+is  "source line written"  "$(grep -c 'dcw venv helpers' "$V/.zshenv")" "1"
+has "verifies the helpers" "$out" "loads venvhere + venvhmx"
+# zsh has no `type -t` (that is bash); `whence -w` is the zsh way to ask what a
+# name is. Assert the word, not just "something resolved".
+is  "fresh zsh has venvhere" "$(HOME="$V" "$ZSH_BIN" -lic 'whence -w venvhere' 2>/dev/null)" "venvhere: function"
+is  "fresh zsh has venvhmx"  "$(HOME="$V" "$ZSH_BIN" -lic 'whence -w venvhmx' 2>/dev/null)" "venvhmx: function"
+
+vh() { HOME="$V" "$ZSH_BIN" -lic "$1" 2>/dev/null; }
+is "venvhere keeps the cwd"      "$(vh 'cd /tmp && venvhere >/dev/null; pwd')" "/tmp"
+is "venvhere uses the config venv" "$(vh 'cd /tmp && venvhere >/dev/null; printf %s "$VIRTUAL_ENV"')" "$FAKE_VENV"
+is "venvhmx cds to the repo"     "$(vh "cd /tmp && venvhmx >/dev/null; pwd")" "$FAKE_REPO"
+is "venvhmx activates the venv"  "$(vh "cd /tmp && venvhmx >/dev/null; printf %s \"\$VIRTUAL_ENV\"")" "$FAKE_VENV"
+# A .venv inside the project wins over the shared/config one, and venvhere must
+# still not move the caller (that is the whole point of the helper).
+is "project .venv wins"          "$(vh 'cd '"$FAKE_REPO"' && venvhere >/dev/null; printf %s "$VIRTUAL_ENV"')" "$FAKE_REPO/.venv"
+is "no cd from a nested dir"     "$(vh 'cd '"$FAKE_REPO/hmx"' && venvhere >/dev/null; pwd')" "$FAKE_REPO/hmx"
+is "explicit venv argument wins" "$(vh "venvhere $FAKE_VENV >/dev/null; printf %s \"\$VIRTUAL_ENV\"")" "$FAKE_VENV"
+is "bad path exits 1"            "$(vh 'venvhere /nonexistent >/dev/null 2>&1; echo rc=$?')" "rc=1"
+has "bad path is reported"       "$(vh 'venvhere /nonexistent 2>&1 >/dev/null')" "venvhere: venv tidak ditemukan"
+is "no venv left active on failure" "$(vh 'venvhere /nonexistent >/dev/null 2>&1; printf %s "${VIRTUAL_ENV:-none}"')" "none"
+is "single PATH entry after repeat" "$(vh "venvhere >/dev/null; venvhere >/dev/null; printf %s \"\$PATH\" | tr ':' '\n' | grep -cx '$FAKE_VENV/bin'")" "1"
+out=$(HOME="$V" bash "$SRC" --bin "$V/.local/bin" --repo "$FAKE_REPO" --venv "$FAKE_VENV" \
+      --port-base 4200 --port-max 4215 --yes 2>&1)
+has "re-run: already sourced" "$out" "already sourced in $V/.zshenv"
+is  "no duplicate source line" "$(grep -c 'dcw venv helpers' "$V/.zshenv")" "1"
+
+echo "== 11. uninstall strips the rc blocks and leaves the rest alone =="
+printf '# sentinel: this line is not ours\n' >> "$V/.zshenv"
+out=$(HOME="$V" bash "$(cd "$(dirname "$SRC")" && pwd)/uninstall.sh" "$V/.local/bin" 2>&1)
+has "removes the binary" "$out" "removed $V/.local/bin/dcw"
+is  "binary gone"       "$([ -e "$V/.local/bin/dcw" ] && echo yes || echo no)" "no"
+is  "config dir gone"   "$([ -d "$V/.config/dcw" ] && echo yes || echo no)" "no"
+is  "no dcw markers left" "$(grep -c 'added by dcw installer\|dcw shell integration\|dcw venv helpers' "$V/.zshenv")" "0"
+is  "no function left"  "$(HOME="$V" "$ZSH_BIN" -lic 'type -t venvhere' 2>/dev/null)" ""
+is  "rc backup written" "$([ -f "$V/.zshenv.dcw-uninstall.bak" ] && echo yes)" "yes"
+has "backup still has the block" "$(cat "$V/.zshenv.dcw-uninstall.bak")" "dcw venv helpers"
+has "unrelated rc content kept" "$(cat "$V/.zshenv")" "sentinel"
+
 if [ "${SKIP_LIVE:-0}" = 1 ]; then
-  echo "== 10. live install on this host — SKIPPED (SKIP_LIVE=1) =="
+  echo "== 12. live install on this host — SKIPPED (SKIP_LIVE=1) =="
 else
-  echo "== 10. live install on this host =="
+  echo "== 12. live install on this host =="
   is  "dcw installed" "$([ -x "$HOME/.local/bin/dcw" ] && echo yes)" "yes"
   cfg=$(cat "$HOME/.config/dcw/config" 2>/dev/null || true)
   has "config repo"  "$cfg" "DEV_CAPTAIN_REPO:=$REPO"
@@ -169,7 +231,11 @@ else
   is  "login shell loads dcw as a function" "$("$ZSH_BIN" -lic 'whence -w dcw' 2>/dev/null)" "dcw: function"
   is  "dcw path <branch> points into .worktrees" \
       "$("$ZSH_BIN" -lic 'dcw path dcw-selftest' 2>/dev/null)" "$REPO/.worktrees/dcw-selftest"
-  is  "dcw status runs" "$("$HOME/.local/bin/dcw" status 2>&1)" "(no active captains)"
+  is  "venv helpers installed" "$([ -f "$HOME/.config/dcw/shell/venv.sh" ] && echo yes)" "yes"
+  is  "login shell has venvhere" "$("$ZSH_BIN" -lic 'whence -w venvhere' 2>/dev/null)" "venvhere: function"
+  is  "login shell has venvhmx"  "$("$ZSH_BIN" -lic 'whence -w venvhmx' 2>/dev/null)" "venvhmx: function"
+  # Not "no active captains": this host may legitimately have worktrees running.
+  is  "dcw status exits 0" "$("$HOME/.local/bin/dcw" status >/dev/null 2>&1; echo rc=$?)" "rc=0"
 fi
 
 echo

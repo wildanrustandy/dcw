@@ -956,6 +956,11 @@ Shell integration:
   process cannot change its parent shell's directory, so this has to be a
   function. Override the binary it calls with DCW_BIN; bypass the function with
   'command dcw ...'. Re-run install.sh to refresh it.
+  The installer also ships two venv helpers (see shell/venv.sh in the repo):
+    venvhmx    activate the project venv and cd into the project
+    venvhere   activate the venv for the CURRENT directory, staying put — pairs
+               with 'dcw start <branch>', which moves you into the worktree
+  Both read the dcw config for DEV_CAPTAIN_REPO / DEV_CAPTAIN_VENV.
 
 State:
   Port registry:  $REG
