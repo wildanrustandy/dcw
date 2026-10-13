@@ -158,7 +158,7 @@ atau edit `~/.config/dcw/config`.
 dcw start <branch>    # buat worktree + clone DB + salin file privat + namespace Redis
                       # + jalankan server + worker Celery branch itu
                       # → shell otomatis cd ke worktree (lihat "Integrasi shell")
-dcw status            # daftar captain aktif (port, pid, hidup/mati, celery)
+dcw status            # daftar captain aktif (port, pid, hidup/mati, celery, URL)
 dcw list              # daftar semua git worktree
 dcw path <branch>     # cetak direktori branch (base → repo utama, lain → .worktrees/<branch>)
 dcw logs <branch> [celery]   # tail log server, atau log worker branch itu
@@ -175,7 +175,7 @@ Contoh:
 dcw start wildantest
 # ✓ captain started: wildantest
 #   worktree: ~/dev/hmx-002/.worktrees/wildantest
-#   port:     5201   preview: http://127.0.0.1:5201
+#   port:     5201   preview: https://<user>-5201.devx.hashmicro.co
 #   db:       cloning hmxmain -> wildantest
 #   celery:  worker up (pid 12345, ns wildan2-hmx-local-wildantest)
 
@@ -185,6 +185,35 @@ dcw start <base-branch>   # base branch → langsung di repo utama, port 5200
 Base branch dideteksi dari `origin/HEAD` (branch default yang dideklarasikan repo,
 sama seperti `dev-captain`); fallback ke branch yang sedang aktif di repo, lalu `main`.
 Untuk memaksa: `DEV_CAPTAIN_BASE=<branch> dcw start <branch>`.
+
+## Preview URL (nginx wildcard DevSpace)
+
+Kolom URL di `dcw status` dan baris `preview:` di `dcw start` berisi alamat yang bisa
+langsung dibuka di browser. Kalau host punya reverse proxy wildcard DevSpace
+(`/etc/devspace-nginx-routes.env`), dcw memakai skema yang sama dengan
+`/opt/dev-tools/dev-captain`:
+
+| Branch | URL | Diteruskan nginx ke |
+|---|---|---|
+| base (`$BASE`) | `https://<user>.<domain>` | `127.0.0.1:$PORT_BASE` |
+| worktree | `https://<user>-<port>.<domain>` | `127.0.0.1:<port>` |
+
+Domain dideteksi otomatis: env `DEVSPACE_DOMAIN`, lalu `/etc/devspace-nginx-routes.env`.
+Tanpa keduanya (mis. Mac lokal) URL-nya tetap `http://127.0.0.1:<port>` seperti sebelumnya.
+
+Override:
+
+```sh
+DCW_DOMAIN=example.test DCW_USER=bob dcw status   # domain/user lain
+DCW_DOMAIN= dcw status                            # paksa http://127.0.0.1:<port>
+```
+
+`DCW_DOMAIN` boleh juga ditaruh di `~/.config/dcw/config`; env per-call tetap menang.
+
+URL itu hanya hidup kalau nginx di host benar-benar memetakan host tersebut ke port itu:
+`<user>-<port>` hanya untuk port di range yang diberikan ke user (`/etc/apollo-devhost/user-ports.map`),
+dan `<user>.<domain>` selalu menunjuk ke **base port** user itu — jadi URL base branch baru
+benar kalau `PORT_BASE` di config dcw sama dengan base port yang diberikan host.
 
 ## Celery per branch
 

@@ -41,6 +41,20 @@ VENV="${DEV_CAPTAIN_VENV:-$HOME/dev/.venv}"
 PORT_BASE="${PORT_BASE:-5200}"
 PORT_MAX="${PORT_MAX:-5220}"
 
+# ── Preview URL domain (DevSpace wildcard nginx, like dev-captain) ─
+#   <user>.devx.hashmicro.co        -> 127.0.0.1:$PORT_BASE   (base branch)
+#   <user>-<port>.devx.hashmicro.co -> 127.0.0.1:<port>       (worktree)
+# Auto-detected so a box without that reverse proxy keeps plain 127.0.0.1 URLs.
+# Set DCW_DOMAIN to override; set it EMPTY (DCW_DOMAIN=) to force localhost URLs.
+if [ -z "${DCW_DOMAIN+set}" ]; then
+  DCW_DOMAIN="${DEVSPACE_DOMAIN:-}"
+  if [ -z "$DCW_DOMAIN" ] && [ -r /etc/devspace-nginx-routes.env ]; then
+    DCW_DOMAIN=$(awk -F= '$1 == "DEVSPACE_DOMAIN" { print $2; exit }' \
+      /etc/devspace-nginx-routes.env 2>/dev/null || true)
+  fi
+fi
+DCW_USER="${DCW_USER:-${USER:-$(id -un)}}"
+
 # ── Per-branch Celery (opt out with DCW_CELERY=0) ─────────────────
 # One worker per branch, isolated from every other branch by the branch's
 # HMX_INSTANCE_NAMESPACE (see _set_worktree_env_namespace). Queues default to
@@ -95,6 +109,17 @@ for port, info in d.items():
     if b == '$branch':
         print(port); break
 "
+}
+
+_url_of() { # port [branch] -> URL to open (wildcard host when a domain is known)
+  local port="$1" branch="${2:-}"
+  if [ -z "$DCW_DOMAIN" ]; then
+    printf 'http://127.0.0.1:%s\n' "$port"
+  elif [ "$branch" = "$BASE" ]; then
+    printf 'https://%s.%s\n' "$DCW_USER" "$DCW_DOMAIN"
+  else
+    printf 'https://%s-%s.%s\n' "$DCW_USER" "$port" "$DCW_DOMAIN"
+  fi
 }
 
 _record_pid() { # update pid for an existing port entry
@@ -582,7 +607,7 @@ case "$cmd" in
       existing_pid=$(_pid_for_port "$port")
       if [ -n "$existing_pid" ]; then
         echo "✓ $branch already running (pid $existing_pid) on port $port"
-        echo "  preview: http://127.0.0.1:$port"
+        echo "  preview: $(_url_of "$port" "$branch")"
         _celery_start "$branch" || true
         exit 0
       fi
@@ -591,7 +616,7 @@ case "$cmd" in
       echo "✓ captain started: $branch (base)"
       echo "  dir:     $REPO"
       echo "  port:    $port  (pid $pid)"
-      echo "  preview: http://127.0.0.1:$port"
+      echo "  preview: $(_url_of "$port" "$branch")"
       echo "  log:     $log"
       _celery_start "$branch" || true
       exit 0
@@ -642,7 +667,7 @@ case "$cmd" in
     existing_pid=$(_pid_for_port "$port")
     if [ -n "$existing_pid" ]; then
       echo "already running (pid $existing_pid)"
-      echo "  preview: http://127.0.0.1:$port"
+      echo "  preview: $(_url_of "$port" "$branch")"
       _celery_start "$branch" || true
       exit 0
     fi
@@ -657,7 +682,7 @@ case "$cmd" in
     echo "✓ captain started: $branch"
     echo "  worktree: $wt"
     echo "  port:     $port  (pid $pid)"
-    echo "  preview:  http://127.0.0.1:$port"
+    echo "  preview:  $(_url_of "$port" "$branch")"
     echo "  log:      $log"
     _celery_start "$branch" || true
     ;;
@@ -688,6 +713,18 @@ except Exception:
     d = {}
 cel_dir = "$CELERY_STATE"
 cel_log = "$LOGDIR"
+
+# Preview URL — mirrors _url_of() in the shell half of this script.
+domain = "$DCW_DOMAIN"
+me = "$DCW_USER"
+base = "$BASE"
+
+def url_for(port, branch):
+    if not domain:
+        return f"http://127.0.0.1:{port}"
+    if branch == base:
+        return f"https://{me}.{domain}"
+    return f"https://{me}-{port}.{domain}"
 
 def proc_state(pid):
     # 'Z' matters: kill -0 (and os.kill(pid, 0)) succeeds for a zombie, so a
@@ -762,7 +799,7 @@ if not shown and not workers:
 else:
     print(f"{'PORT':<7}{'BRANCH':<40}{'PID':<10}{'STATUS':<10}{'CELERY':<10}URL")
     for port, branch, pid, status in shown:
-        url = f"http://127.0.0.1:{port}"
+        url = url_for(port, branch)
         print(f"{port:<7}{branch:<40}{str(pid):<10}{status:<10}{celery_state(branch):<10}{url}")
     for b, st in workers:
         if not any(r[1] == b for r in shown):
@@ -983,6 +1020,14 @@ Shell integration:
                with 'dcw start <branch>', which moves you into the worktree
   Both read the dcw config for DEV_CAPTAIN_REPO / DEV_CAPTAIN_VENV.
 
+Preview URLs (dcw status + dcw start):
+  When a domain is known (DevSpace wildcard nginx), the URL column and the
+  'preview:' line point at the reverse proxy instead of localhost:
+    base branch : https://<user>.<domain>          (nginx -> 127.0.0.1:$PORT_BASE)
+    worktree    : https://<user>-<port>.<domain>   (nginx -> 127.0.0.1:<port>)
+  Same scheme as /opt/dev-tools/dev-captain. Without a domain (or DCW_DOMAIN=)
+  they stay plain http://127.0.0.1:<port>.
+
 State:
   Port registry:  $REG
   Logs:           $LOGDIR/
@@ -995,6 +1040,9 @@ Env overrides:
   DEV_CAPTAIN_VENV   venv path      (default: \$HOME/dev/.venv)
   PORT_BASE          base port      (default: 5200)
   PORT_MAX           max port       (default: 5220)
+  DCW_DOMAIN         preview URL domain (default: \$DEVSPACE_DOMAIN, else
+                     /etc/devspace-nginx-routes.env; empty = 127.0.0.1 URLs)
+  DCW_USER           user part of the preview host (default: \$USER)
   DCW_CELERY         1 = start a worker per branch, 0 = never (default: 1)
   DCW_CELERY_QUEUES  worker -Q list (default: $CELERY_QUEUES)
   DCW_CELERY_CONCURRENCY  worker --concurrency (default: $CELERY_CONCURRENCY)
