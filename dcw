@@ -164,11 +164,15 @@ _db_name_for_branch() { # branch -> postgres db name (lowercase, safe chars)
   printf '%s\n' "$1" | tr '/[:upper:].-' '_[:lower:]__' | tr -cd '[:alnum:]_' | cut -c1-63
 }
 
-_env_value() { # read KEY= from a .env file
+_env_value() { # read KEY= from a .env file (empty if the file is unreadable)
   python3 - "$1" "$2" <<'PY'
 import sys
 path, key = sys.argv[1:3]
-with open(path) as fh:
+try:
+    fh = open(path)
+except OSError:
+    sys.exit(0)          # no .env -> no value; callers apply their own default
+with fh:
     for line in fh:
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
@@ -202,19 +206,19 @@ _db_clone() { # clone base DB -> worktree DB (template clone, dump/restore fallb
   src_db=$(_db_default_name)
   dst_db=$(_db_name_for_branch "$branch")
   _db_conn_vars
-  if PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d postgres -Atqc \
+  if PGPASSWORD="$db_password" psql -w -h "$db_host" -p "$db_port" -U "$db_user" -d postgres -Atqc \
       "SELECT 1 FROM pg_database WHERE datname = '$dst_db'" 2>/dev/null | grep -qx 1; then
     echo "  db:      $dst_db already exists"
     return 0
   fi
   echo "  db:      cloning $src_db -> $dst_db"
-  if PGPASSWORD="$db_password" createdb -h "$db_host" -p "$db_port" -U "$db_user" -T "$src_db" "$dst_db" 2>/dev/null; then
+  if PGPASSWORD="$db_password" createdb -w -h "$db_host" -p "$db_port" -U "$db_user" -T "$src_db" "$dst_db" 2>/dev/null; then
     return 0
   fi
   echo "  db:      template clone failed (source DB in use?); retrying with dump/restore"
-  PGPASSWORD="$db_password" createdb -h "$db_host" -p "$db_port" -U "$db_user" "$dst_db" || return 1
-  PGPASSWORD="$db_password" pg_dump -h "$db_host" -p "$db_port" -U "$db_user" --no-owner --no-privileges "$src_db" \
-    | PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d "$dst_db" -q
+  PGPASSWORD="$db_password" createdb -w -h "$db_host" -p "$db_port" -U "$db_user" "$dst_db" || return 1
+  PGPASSWORD="$db_password" pg_dump -w -h "$db_host" -p "$db_port" -U "$db_user" --no-owner --no-privileges "$src_db" \
+    | PGPASSWORD="$db_password" psql -w -h "$db_host" -p "$db_port" -U "$db_user" -d "$dst_db" -q
 }
 
 _db_drop() { # drop the worktree DB
@@ -223,13 +227,14 @@ _db_drop() { # drop the worktree DB
   local dst_db
   dst_db=$(_db_name_for_branch "$branch")
   _db_conn_vars
-  if ! PGPASSWORD="$db_password" psql -h "$db_host" -p "$db_port" -U "$db_user" -d postgres -Atqc \
+  if ! PGPASSWORD="$db_password" psql -w -h "$db_host" -p "$db_port" -U "$db_user" -d postgres -Atqc \
       "SELECT 1 FROM pg_database WHERE datname = '$dst_db'" 2>/dev/null | grep -qx 1; then
     echo "  db:      $dst_db does not exist"
     return 0
   fi
   echo "  db:      dropping $dst_db"
-  PGPASSWORD="$db_password" dropdb -h "$db_host" -p "$db_port" -U "$db_user" --if-exists "$dst_db"
+  PGPASSWORD="$db_password" dropdb -w -h "$db_host" -p "$db_port" -U "$db_user" --if-exists "$dst_db" \
+    || { echo "  db:      warning: dropdb failed for $dst_db (left in place)" >&2; return 1; }
 }
 
 _set_worktree_db_json() { # point worktree db.json default.NAME at its own DB
@@ -599,6 +604,8 @@ PYFREE
 # comma separated), or a branch name; Enter alone picks the single candidate when
 # there is exactly one, and q cancels.
 _abort_one() { # destroy worktree + port + worker + DB for ONE branch
+  # Every step is non-fatal: this runs in a loop for multi-target abort, and one
+  # target's failure (unreadable .env, dropdb refused) must not strand the rest.
   local branch="$1" wt port
   wt="$WT_DIR/$branch"
   port=$(_port_of "$branch")
@@ -609,10 +616,11 @@ _abort_one() { # destroy worktree + port + worker + DB for ONE branch
   _celery_stop "$branch"
   # if-form, not `[ -d ] && git ...`: a failing AND-list would trip errexit
   if [ -d "$wt" ]; then
-    git -C "$REPO" worktree remove --force "$wt"
+    git -C "$REPO" worktree remove --force "$wt" \
+      || echo "dcw: warning: could not remove worktree $wt" >&2
   fi
   git -C "$REPO" branch -D "$branch" 2>/dev/null || true
-  _db_drop "$branch"
+  _db_drop "$branch" || true
   echo "✓ aborted $branch"
 }
 
