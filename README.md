@@ -186,6 +186,27 @@ Base branch dideteksi dari `origin/HEAD` (branch default yang dideklarasikan rep
 sama seperti `dev-captain`); fallback ke branch yang sedang aktif di repo, lalu `main`.
 Untuk memaksa: `DEV_CAPTAIN_BASE=<branch> dcw start <branch>`.
 
+### Titik awal branch baru
+
+Branch baru dibuat dari **`origin/<base>`** sesudah `git fetch origin`, jadi mulai dari
+commit terbaru di remote — bukan dari ref lokal `<base>`. Ref lokal `<base>` hanya ikut
+bergerak kalau repo utama di-`pull`/`switch`, dan karena repo utama biasanya sedang
+men-checkout `<base>` itu, `git fetch` tidak pernah memperbaruinya. Urutan start-point:
+
+| prioritas | ref | kapan dipakai |
+|---|---|---|
+| 1 | `refs/heads/<branch>` | branch sudah ada lokal — dipakai apa adanya (tidak di-reset) |
+| 2 | `refs/remotes/origin/<base>` | normal: branch baru dari commit terbaru remote |
+| 3 | `refs/heads/<base>` | remote base belum ada (mis. repo tanpa `origin`) |
+
+Branch baru dibuat dengan `--no-track`, jadi `git push` tidak mengarah ke `origin/<base>`.
+Kalau kamu memang ingin tracking seperti `codex-wt`, set sendiri:
+`git branch -u origin/<base>` (hanya kalau branch itu memang salinan base).
+
+Server base (`dcw start <base>`, port `PORT_BASE`) tetap menyajikan apa yang sedang
+di-checkout di repo utama — dcw tidak menyentuh working tree repo utama. Supaya ikut
+latest: `git -C <repo> pull --ff-only`.
+
 ## Preview URL (nginx wildcard DevSpace)
 
 Kolom URL di `dcw status` dan baris `preview:` di `dcw start` berisi alamat yang bisa

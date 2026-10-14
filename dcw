@@ -11,6 +11,9 @@
 #                        (no worktree — the base branch IS $REPO)
 #                        base branch = origin/HEAD, else the branch checked out in
 #                        $REPO, else main; override with DEV_CAPTAIN_BASE
+#                        a NEW branch starts from origin/<base> after a fetch, so
+#                        it begins at the latest remote commit, not at the (often
+#                        stale) local <base> ref; --no-track keeps it off origin/<base>
 #   dcw stop <branch>    stop server + worker; leaves worktree/branch alone
 #   dcw status           list all captains (port, pid, alive, celery) + URLs
 #   dcw list             show all git worktrees (branch, port, dir)
@@ -634,15 +637,33 @@ case "$cmd" in
     fi
     if [ ! -d "$wt" ]; then
       cd "$REPO"
-      if ! git fetch origin 2>&1 | tail -3; then
+      # NOTE: `git fetch origin 2>&1 | tail -3` always exits 0 (the pipeline's
+      # status is tail's), so the old `if !` never fired. Capture the output
+      # instead so a real fetch failure is actually reported.
+      fetch_out=$(git fetch origin 2>&1) || {
         echo "dcw: warning: git fetch origin failed; using existing local refs" >&2
+      }
+      if [ -n "$fetch_out" ]; then
+        printf '%s\n' "$fetch_out" | tail -3
       fi
+      # Start-point order: an existing local branch wins (that is a branch the
+      # user already has), then the REMOTE base, then the local base. The remote
+      # base must outrank the local one: `$REPO` has $BASE checked out, so its
+      # local ref only moves when someone pulls there — dcw's fetch refreshes
+      # refs/remotes/origin/* only. Reading the local ref made new worktrees
+      # start from a stale commit (e.g. 6 behind origin/Inventory).
+      # --no-track: the new branch is not a copy of $BASE, so it must not push
+      # to origin/$BASE by default.
       if git show-ref --verify --quiet "refs/heads/$branch"; then
         git worktree add "$wt" "$branch"
+      elif git show-ref --verify --quiet "refs/remotes/origin/$BASE"; then
+        git worktree add -b "$branch" "$wt" --no-track "origin/$BASE"
       elif git show-ref --verify --quiet "refs/heads/$BASE"; then
         git worktree add -b "$branch" "$wt" "$BASE"
       else
-        git worktree add -b "$branch" "$wt" "origin/$BASE"
+        echo "dcw: error: neither origin/$BASE nor local $BASE exists in $REPO." >&2
+        echo "       fetch the base branch, or set DEV_CAPTAIN_BASE=<branch>." >&2
+        exit 2
       fi
     fi
 
