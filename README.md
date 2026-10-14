@@ -171,29 +171,34 @@ dcw celery start|restart|stop [branch]   # kelola worker (default: base branch)
 dcw celery status     # semua worker: pid, hidup/mati, namespace Redis, log
 ```
 
-### stop / abort tanpa argumen (menu pilihan)
+### stop / abort tanpa argumen (menu panah)
 
-`dcw stop` dan `dcw abort` tanpa `<branch>` menampilkan menu bernomor supaya nama
+`dcw stop` dan `dcw abort` tanpa `<branch>` membuka menu navigasi panah, jadi nama
 branch tidak perlu diingat atau diketik:
 
 ```
-$ dcw stop
-#    BRANCH                                 PORT    STATUS
-1    P-DB-11612                             4201    up
-2    inven-standard-rules                   4203    up
-3    Inventory                              4200    down
-Select (number(s), branch name, q = cancel): 1
+  BRANCH                                 PORT    STATUS
+> [ ] P-DB-11612                          4201    up
+  [ ] inven-standard-rules                4203    up
+  [ ] Inventory                           4200    down
+
+  up/down move   Space select   Enter confirm   q cancel
 ```
+
+| Tombol | Fungsi |
+|---|---|
+| `↑` / `↓` | pindah baris (berhenti di ujung, tidak memutar) |
+| `Space` | tandai/lepas baris — untuk stop/abort beberapa sekaligus |
+| `Enter` | jalankan pilihan: baris bertanda, atau baris di bawah kursor kalau tidak ada yang ditandai |
+| `q` / `Esc` / `Ctrl-C` | tutup menu tanpa melakukan apa pun |
+| huruf/angka | filter: kursor melompat ke branch yang berawalan itu (`Backspace` menghapus) |
 
 - Kandidat `stop` = captain di registry port; yang hidup ditampilkan lebih dulu.
 - Kandidat `abort` = worktree yang dikelola dcw saja (anak `$WT_DIR`); repo utama dan
   worktree di luar `$WT_DIR` tidak pernah ditawarkan.
-- Pilihan: satu nomor, beberapa nomor (`1 3` atau `1,3`), atau nama branch langsung.
-  Duplikat dibuang. `q` membatalkan. Kalau kandidatnya cuma satu, Enter memilihnya.
-  Salah input diberi kesempatan 3 kali, lalu batal.
-- `abort` multi-target memakai satu konfirmasi gabungan (`Proceed? [y/N]`).
-- Hanya interaktif: kalau stdin bukan TTY (dipakai script/cron), perintah langsung
-  keluar dengan usage + exit 2, bukan menggantung menunggu input.
+- `abort` beberapa target memakai satu konfirmasi gabungan (`Proceed? [y/N]`).
+- Menu butuh TTY: kalau stdin bukan TTY (script/cron), perintah keluar dengan usage +
+  exit 2, bukan menggantung menunggu input. Di script, sebut branch-nya eksplisit.
 - `dcw stop <branch>` dan `dcw abort <branch>` dengan argumen tidak berubah perilakunya.
 
 Contoh:
