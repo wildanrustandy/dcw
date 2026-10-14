@@ -162,12 +162,39 @@ dcw status            # daftar captain aktif (port, pid, hidup/mati, celery, URL
 dcw list              # daftar semua git worktree
 dcw path <branch>     # cetak direktori branch (base → repo utama, lain → .worktrees/<branch>)
 dcw logs <branch> [celery]   # tail log server, atau log worker branch itu
-dcw stop <branch>     # stop server + worker (worktree + DB tetap)
-dcw abort <branch>    # hapus worktree + stop server/worker + DROP DB branch (konfirmasi)
+dcw stop [branch]     # stop server + worker (worktree + DB tetap)
+                      # tanpa <branch> → menu pilihan captain yang jalan
+dcw abort [branch]    # hapus worktree + stop server/worker + DROP DB branch (konfirmasi)
+                      # tanpa <branch> → menu pilihan worktree milik dcw
 
 dcw celery start|restart|stop [branch]   # kelola worker (default: base branch)
 dcw celery status     # semua worker: pid, hidup/mati, namespace Redis, log
 ```
+
+### stop / abort tanpa argumen (menu pilihan)
+
+`dcw stop` dan `dcw abort` tanpa `<branch>` menampilkan menu bernomor supaya nama
+branch tidak perlu diingat atau diketik:
+
+```
+$ dcw stop
+#    BRANCH                                 PORT    STATUS
+1    P-DB-11612                             4201    up
+2    inven-standard-rules                   4203    up
+3    Inventory                              4200    down
+Select (number(s), branch name, q = cancel): 1
+```
+
+- Kandidat `stop` = captain di registry port; yang hidup ditampilkan lebih dulu.
+- Kandidat `abort` = worktree yang dikelola dcw saja (anak `$WT_DIR`); repo utama dan
+  worktree di luar `$WT_DIR` tidak pernah ditawarkan.
+- Pilihan: satu nomor, beberapa nomor (`1 3` atau `1,3`), atau nama branch langsung.
+  Duplikat dibuang. `q` membatalkan. Kalau kandidatnya cuma satu, Enter memilihnya.
+  Salah input diberi kesempatan 3 kali, lalu batal.
+- `abort` multi-target memakai satu konfirmasi gabungan (`Proceed? [y/N]`).
+- Hanya interaktif: kalau stdin bukan TTY (dipakai script/cron), perintah langsung
+  keluar dengan usage + exit 2, bukan menggantung menunggu input.
+- `dcw stop <branch>` dan `dcw abort <branch>` dengan argumen tidak berubah perilakunya.
 
 Contoh:
 
