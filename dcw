@@ -7,6 +7,7 @@
 #   dcw start <branch>   create worktree, clone DB, copy private files, point the
 #                        worktree .env at its own DB + Redis namespace, then start
 #                        the server and a per-branch Celery worker.
+#                        with no <branch>, pick from an arrow-key menu of branches
 #                        if <branch> == base branch, runs in $REPO on $PORT_BASE
 #                        (no worktree — the base branch IS $REPO)
 #                        base branch = origin/HEAD, else the branch checked out in
@@ -22,8 +23,9 @@
 #                        used by the shell wrapper to cd after `dcw start`
 #   dcw abort <branch>   destroy worktree + server + worker + worktree DB (no merge)
 #                        with no <branch>, pick from an arrow-key menu of dcw worktrees
-#   dcw logs <branch> [celery]
+#   dcw logs [branch] [celery]
 #                        tail the server log, or the branch's worker log
+#                        with no <branch>, pick a log from an arrow-key menu
 #   dcw celery start|restart|stop|status [branch]
 #                        manage a branch's worker (default: base branch)
 #
@@ -595,14 +597,15 @@ PYFREE
   _unlocked
 }
 
-# ── Interactive target picker (dcw stop / dcw abort without a branch) ─────
-# With no branch argument both commands print a numbered menu and read a
-# selection, so the branch name does not have to be remembered. The candidate
-# set differs per command: stop lists captains from the port registry, abort
-# lists the worktrees dcw actually manages ($WT_DIR children only — abort never
-# touches any other path). Selection accepts a number, several numbers (space or
-# comma separated), or a branch name; Enter alone picks the single candidate when
-# there is exactly one, and q cancels.
+# ── Interactive target picker (dcw stop / dcw abort / dcw logs, no argument) ─
+# With no branch argument these commands open an arrow-key menu, so the target
+# does not have to be remembered. The candidate set differs per command: stop
+# lists captains from the port registry, abort lists the worktrees dcw actually
+# manages ($WT_DIR children only — abort never touches any other path), logs
+# lists the log files that exist in $LOGDIR. Up/down move, Space marks rows,
+# Enter confirms (a typed prefix picks the first matching branch), q cancels.
+# What each mode writes to stdout is its own value: stop/abort print branch
+# names, logs prints log paths (see value_idx in _pick_targets).
 _abort_one() { # destroy worktree + port + worker + DB for ONE branch
   # Every step is non-fatal: this runs in a loop for multi-target abort, and one
   # target's failure (unreadable .env, dropdb refused) must not strand the rest.
@@ -689,11 +692,171 @@ for block in [b for b in out.strip().split("\n\n") if b.strip()]:
 PYABT
 }
 
-_pick_targets() { # <stop|abort> -> selected branches on stdout; 1 = cancelled
-  local mode="$1" rows n
+_pick_rows_logs() { # path<TAB>branch<TAB>kind<TAB>size<TAB>age — up captains only
+  [ -d "$LOGDIR" ] || return 0
+  python3 - "$LOGDIR" "$REG" "$BASE" <<'PYLOG'
+import json, os, sys, time
+log_dir, reg, base = sys.argv[1:4]
+
+def alive(pid):
+    # 'Z' counts as dead: os.kill(pid, 0) succeeds for a zombie, so a process
+    # that died during startup would otherwise read as running.
+    try:
+        st = open("/proc/%d/stat" % int(pid)).read().rsplit(") ", 1)[1].split(" ", 1)[0]
+    except Exception:
+        return False
+    return st != "Z"
+
+# Log files are named after the SLUGGED branch ('feature/x' -> 'feature_x.log'),
+# so map slug back to the real branch name to show what the user typed in git.
+# Only branches whose captain is UP right now are offered: tailing the log of a
+# branch that is not running is a different (and misleading) request, and the
+# menu is meant to answer "which running captain's log do I want to watch".
+names = {}
+try:
+    d = json.load(open(reg))
+except Exception:
+    d = {}
+for port, info in d.items():
+    if not isinstance(info, dict):
+        continue
+    b = info.get("branch")
+    if not b:
+        continue
+    pid = info.get("pid", 0)
+    if pid and alive(pid):
+        names[b.replace("/", "_")] = b
+if not names:
+    sys.exit(0)
+
+def human(n):
+    if n < 1024:
+        return "%dB" % n
+    if n < 1024 * 1024:
+        return "%.0fK" % (n / 1024)
+    if n < 1024 ** 3:
+        return "%.1fM" % (n / 1024 ** 2)
+    return "%.1fG" % (n / 1024 ** 3)
+
+def age(mtime):
+    s = max(0, int(time.time() - mtime))
+    if s < 60:
+        return "%ds" % s
+    if s < 3600:
+        return "%dm" % (s // 60)
+    if s < 86400:
+        return "%dh" % (s // 3600)
+    return "%dd" % (s // 86400)
+
+rows = []
+for name in os.listdir(log_dir):
+    path = os.path.join(log_dir, name)
+    if not name.endswith(".log") or not os.path.isfile(path):
+        continue
+    if name.endswith("-celery.log"):
+        kind, stem = "celery", name[: -len("-celery.log")]
+    elif name == "main.log":
+        # The base branch runs in $REPO and logs to main.log, not <slug>.log.
+        kind, stem = "server", (base or "").replace("/", "_")
+    else:
+        kind, stem = "server", name[: -len(".log")]
+    branch = names.get(stem)
+    if branch is None:
+        continue                  # not a currently-running captain: skip it
+    try:
+        st = os.stat(path)
+    except OSError:
+        continue
+    rows.append((st.st_mtime, branch, kind, human(st.st_size), age(st.st_mtime), path))
+# Newest first: the log being written right now is the one usually wanted.
+rows.sort(key=lambda r: (-r[0], r[1], r[2]))
+for _mt, branch, kind, size, when, path in rows:
+    print("%s\t%s\t%s\t%s\t%s" % (path, branch, kind, size, when))
+PYLOG
+}
+
+_pick_rows_start() { # branch<TAB>state<TAB>head — branches that can be started
+  [ -d "$REPO/.git" ] || return 0
+  python3 - "$REPO" "$WT_DIR" "$REG" "$BASE" <<'PYSTART'
+import json, os, subprocess, sys
+repo, wt_dir, reg, base = sys.argv[1:5]
+
+def git(*a):
+    return subprocess.run(["git", "-C", repo] + list(a),
+                          capture_output=True, text=True).stdout
+
+# Branches that already have a dcw worktree, so we can mark them "worktree".
+have_wt = set()
+for line in git("worktree", "list", "--porcelain").splitlines():
+    if line.startswith("branch "):
+        have_wt.add(line[len("branch "):].replace("refs/heads/", ""))
+
+try:
+    d = json.load(open(reg))
+except Exception:
+    d = {}
+port_of = {}
+for port, info in d.items():
+    b = info.get("branch") if isinstance(info, dict) else info
+    if b:
+        port_of[b] = port
+
+# Candidate branches: local heads, plus remote-only ones (start will create them
+# from origin/<base> anyway, but a remote branch named the same is a real branch
+# the user may mean). The base branch itself is excluded — starting it is a
+# no-arg fast path that needs no choose-from-a-list.
+local = set()
+for line in git("for-each-ref", "--format=%(refname:short)", "refs/heads/").splitlines():
+    if line.strip():
+        local.add(line.strip())
+remote = set()
+for name in git("for-each-ref", "--format=%(refname:short)",
+                "refs/remotes/origin/").splitlines():
+    name = name.strip()
+    if not name or name in ("origin/HEAD", "origin"):
+        continue
+    b = name[len("origin/"):]
+    if b == "HEAD":
+        continue
+    remote.add(b)
+
+# HEAD commit for the label: a local ref's short sha, else the remote's.
+def short_sha(ref):
+    return git("rev-parse", "--short", ref).strip() or "-"
+
+rows = []
+for b in sorted(local | remote):
+    if b == base:
+        continue
+    if b in local:
+        state = "running" if b in port_of else ("stopped" if b in have_wt else "local")
+        ref = b
+    else:
+        state = "remote"
+        ref = "origin/" + b
+    rows.append((0 if state == "running" else 1, b, state, short_sha(ref)))
+# Ones already up first, then by branch name.
+rows.sort(key=lambda r: (r[0], r[1]))
+for _pri, b, state, head in rows:
+    print("%s\t%s\t%s" % (b, state, head))
+PYSTART
+}
+
+_pick_targets() { # <stop|abort|logs|start> -> selected values on stdout; 1 = cancelled
+  local mode="$1" rows n value_idx=1 name_idx=1
+  # value_idx = the field the picker prints (stop/abort: branch name at 1,
+  #             logs: log path at 0, start: branch name at 0).
+  # name_idx  = the field the type-to-jump filter matches (always the branch
+  #             name). if-form, not `[ ] && ...`: a failing AND-list trips errexit.
+  if [ "$mode" = logs ]; then value_idx=0; fi
+  if [ "$mode" = start ]; then value_idx=0; name_idx=0; fi
   rows=$(mktemp "${TMPDIR:-/tmp}/dcw-pick.XXXXXX")
   if [ "$mode" = stop ]; then
     _pick_rows_stop > "$rows"
+  elif [ "$mode" = logs ]; then
+    _pick_rows_logs > "$rows"
+  elif [ "$mode" = start ]; then
+    _pick_rows_start > "$rows"
   else
     _pick_rows_abort > "$rows"
   fi
@@ -702,22 +865,27 @@ _pick_targets() { # <stop|abort> -> selected branches on stdout; 1 = cancelled
     rm -f "$rows"
     if [ "$mode" = stop ]; then
       echo "no captains in $REG — nothing to stop" >&2
+    elif [ "$mode" = logs ]; then
+      echo "no running captains — nothing to tail (start one with 'dcw start')" >&2
+    elif [ "$mode" = start ]; then
+      echo "no startable branches in $REPO (base '$BASE' excluded) — nothing to start" >&2
     else
       echo "no dcw worktrees under $WT_DIR — nothing to abort" >&2
     fi
     return 1
   fi
 
-  # The menu talks to /dev/tty and only the chosen branches go to stdout: the
+  # The menu talks to /dev/tty and only the chosen values go to stdout: the
   # caller captures stdout (`selected=$(_pick_targets ...)`), so mixing them would
   # capture the menu too. It is python, not bash, because navigation needs raw
   # per-key input and cursor control. ASCII only: the picker may run under a
   # non-UTF-8 locale, where printing arrows would raise UnicodeEncodeError.
   local rc=0
-  python3 - "$rows" "$mode" <<'PYPICK' || rc=$?
-import sys, termios, tty, select
+  python3 - "$rows" "$mode" "$value_idx" "$name_idx" <<'PYPICK' || rc=$?
+import sys, termios, tty, select, os
 
 rows_path, mode = sys.argv[1], sys.argv[2]
+value_idx, name_idx = int(sys.argv[3]), int(sys.argv[4])
 rows = []
 with open(rows_path) as fh:
     for line in fh:
@@ -739,15 +907,44 @@ except OSError:
 fd = tin.fileno()
 saved = termios.tcgetattr(fd)
 
+def term_lines():
+    # The alt screen is exactly as tall as the terminal, so drawing past the last
+    # row scrolls the header off and every later redraw drifts. The list is
+    # windowed to fit instead. A 0x0 pty (or an unreadable size) -> assume 24.
+    try:
+        lines = os.get_terminal_size(tout.fileno()).lines
+    except OSError:
+        lines = 0
+    return lines or 24
+
+def window(cur):
+    # First row to draw, plus how many fit: keeps `cur` visible and never scrolls
+    # past the end. 3 lines of chrome: header, blank, hint.
+    win = max(1, term_lines() - 3)
+    if len(rows) <= win:
+        return 0, win
+    return min(max(0, cur - win + 1), len(rows) - win), win
+
 def draw(cur, chosen, typed=""):
+    top, win = window(cur)
     out = ["\x1b[H"]
     if mode == "stop":
         out.append("  %-38s %-7s %s\n" % ("BRANCH", "PORT", "STATUS"))
+    elif mode == "logs":
+        out.append("  %-38s %-7s %-9s %s\n" % ("BRANCH", "KIND", "SIZE", "AGE"))
+    elif mode == "start":
+        out.append("  %-38s %-9s %s\n" % ("BRANCH", "STATE", "HEAD"))
     else:
         out.append("  %-38s %-7s %-10s %s\n" % ("BRANCH", "PORT", "HEAD", "DIR"))
-    for i, f in enumerate(rows):
+    for i in range(top, min(len(rows), top + win)):
+        f = rows[i]
         if mode == "stop":
             cols = "%-38s %-7s %s" % (f[1], f[0], f[2])
+        elif mode == "logs":
+            cols = "%-38s %-7s %-9s %s" % (f[1], f[2], f[3], f[4])
+        elif mode == "start":
+            # start rows are branch<TAB>state<TAB>head (3 fields, no path column)
+            cols = "%-38s %-9s %s" % (f[0], f[1], f[2])
         else:
             cols = "%-38s %-7s %-10s %s" % (f[1], f[0], f[2], f[3])
         mark = "[x]" if chosen[i] else "[ ]"
@@ -756,6 +953,8 @@ def draw(cur, chosen, typed=""):
         else:
             out.append("  %s %s\n" % (mark, cols))
     hint = "  up/down move   Space select   Enter confirm   q cancel"
+    if len(rows) > win:
+        hint += "   %d-%d of %d" % (top + 1, min(len(rows), top + win), len(rows))
     if typed:
         hint += "   filter: %s" % typed
     out.append("\n" + hint + "\n")
@@ -791,18 +990,18 @@ try:
             # rows, then the row under the cursor.
             if typed:
                 hit = next((i for i, f in enumerate(rows)
-                            if f[1].lower().startswith(typed.lower())), None)
-                picked = [rows[hit][1]] if hit is not None else None
+                            if f[name_idx].lower().startswith(typed.lower())), None)
+                picked = [rows[hit][value_idx]] if hit is not None else None
             if picked is None:
-                picked = ([rows[i][1] for i in range(len(rows)) if chosen[i]]
-                          or [rows[cur][1]])
+                picked = ([rows[i][value_idx] for i in range(len(rows)) if chosen[i]]
+                          or [rows[cur][value_idx]])
             break
         elif key in (b"q", b"Q", b"\x03"):
             break
         elif key in (b"\x7f", b"\x08"):
             typed = typed[:-1]
             for i, f in enumerate(rows):
-                if typed and f[1].lower().startswith(typed.lower()):
+                if typed and f[name_idx].lower().startswith(typed.lower()):
                     cur = i
                     break
         elif 32 < key[0] < 127:
@@ -811,7 +1010,7 @@ try:
             # branch names start with those letters.
             typed += key.decode("ascii", "ignore")
             for i, f in enumerate(rows):
-                if f[1].lower().startswith(typed.lower()):
+                if f[name_idx].lower().startswith(typed.lower()):
                     cur = i
                     break
         draw(cur, chosen, typed)
@@ -833,7 +1032,32 @@ cmd="${1:-help}"; shift || true
 
 case "$cmd" in
   start)
-    branch="${1:?usage: dcw start <branch>}"
+    if [ -z "${1:-}" ]; then
+      # No branch given: pick from the branches that can be started. Interactive
+      # only — a non-TTY (script, cron) would just block on the menu.
+      if [ ! -t 0 ]; then
+        echo "usage: dcw start <branch>   (run it in a terminal to pick from a list)" >&2
+        exit 2
+      fi
+      selected=$(_pick_targets start) || exit 0   # cancelled / nothing to start
+      # One branch per run: starting several would need each worktree created and
+      # its server spawned, and the shell wrapper only cds into one of them.
+      branch=$(printf '%s\n' "$selected" | head -n1)
+      [ -n "$branch" ] || exit 0
+      # Tell the shell wrapper which worktree to cd into. The wrapper cannot call
+      # `dcw path` beforehand because the picker is what chose the branch.
+      if [ -n "${DCW_CD_FILE:-}" ]; then
+        if [ "$branch" = "$BASE" ]; then printf '%s\n' "$REPO" > "$DCW_CD_FILE"
+        else printf '%s\n' "$WT_DIR/$branch" > "$DCW_CD_FILE"; fi
+      fi
+      echo "starting $branch"
+    else
+      branch="$1"
+    fi
+    if [ -z "$branch" ]; then
+      echo "usage: dcw start <branch>" >&2
+      exit 2
+    fi
 
     [ -d "$REPO/.git" ] || { echo "error: $REPO is not a git repo — clone first" >&2; exit 2; }
 
@@ -994,7 +1218,7 @@ case "$cmd" in
 
   status|ps)
     python3 <<PYSTAT
-import json, os, subprocess
+import json, os, subprocess, sys
 try:
     d = json.load(open("$REG"))
 except Exception:
@@ -1013,6 +1237,25 @@ def url_for(port, branch):
     if branch == base:
         return f"https://{me}.{domain}"
     return f"https://{me}-{port}.{domain}"
+
+def box(headers, rows):
+    # Unicode box drawing only when stdout can encode it: PYTHONCOERCECLOCALE=0
+    # with a C locale leaves stdout ASCII, where the frame would raise.
+    try:
+        "─".encode(sys.stdout.encoding or "utf-8")
+        tl, tm, tr, ml, mm, mr, bl, bm, br, h, v = "┌┬┐├┼┤└┴┘─│"
+    except (UnicodeEncodeError, LookupError):
+        tl, tm, tr, ml, mm, mr, bl, bm, br, h, v = ("+",) * 9 + ("-", "|")
+    rows = [[str(c) for c in r] for r in rows]
+    w = [max(len(x) for x in col) for col in zip(headers, *rows)]
+    rule = lambda l, m, r: l + m.join(h * (n + 2) for n in w) + r
+    line = lambda r: v + v.join(" %-*s " % (n, c) for n, c in zip(w, r)) + v
+    print(rule(tl, tm, tr))
+    print(line(headers))
+    print(rule(ml, mm, mr))
+    for r in rows:
+        print(line(r))
+    print(rule(bl, bm, br))
 
 def proc_state(pid):
     # 'Z' matters: kill -0 (and os.kill(pid, 0)) succeeds for a zombie, so a
@@ -1085,13 +1328,11 @@ shown = [r for r in rows if r[3] in ("up", "dead")]
 if not shown and not workers:
     print("(no active captains)")
 else:
-    print(f"{'PORT':<7}{'BRANCH':<40}{'PID':<10}{'STATUS':<10}{'CELERY':<10}URL")
-    for port, branch, pid, status in shown:
-        url = url_for(port, branch)
-        print(f"{port:<7}{branch:<40}{str(pid):<10}{status:<10}{celery_state(branch):<10}{url}")
-    for b, st in workers:
-        if not any(r[1] == b for r in shown):
-            print(f"{'-':<7}{b:<40}{'-':<10}{'worker only':<12}{st:<10}(no server)")
+    body = [[port, branch, pid, status, celery_state(branch), url_for(port, branch)]
+            for port, branch, pid, status in shown]
+    body += [["-", b, "-", "worker only", st, "(no server)"]
+             for b, st in workers if not any(r[1] == b for r in shown)]
+    box(["PORT", "BRANCH", "PID", "STATUS", "CELERY", "URL"], body)
 PYSTAT
     ;;
 
@@ -1276,8 +1517,24 @@ PYCEL
     ;;
 
   logs)
-    branch="${1:?usage: dcw logs <branch> [celery]}"
+    branch="${1:-}"
     target="${2:-server}"
+    if [ -z "$branch" ]; then
+      # No branch given: pick from the log files that exist. Interactive only —
+      # a non-TTY (script, cron) would just block on the menu.
+      if [ ! -t 0 ]; then
+        echo "usage: dcw logs <branch> [celery]   (run it in a terminal to pick from a list)" >&2
+        exit 2
+      fi
+      selected=$(_pick_targets logs) || exit 0   # cancelled / no logs yet
+      files=()
+      while IFS= read -r f; do
+        [ -n "$f" ] && files+=("$f")
+      done <<< "$selected"
+      # ${arr[@]+...} guard keeps `set -u` happy if the array were ever empty.
+      if [ "${#files[@]}" -eq 0 ]; then exit 0; fi
+      exec tail -f ${files[@]+"${files[@]}"}
+    fi
     if [ "$target" = "celery" ]; then
       log=$(_celery_logfile "$branch")
     elif [ "$branch" = "$BASE" ]; then
@@ -1294,10 +1551,11 @@ PYCEL
 dcw (local) — worktree + port + Django server + Celery lifecycle for $REPO
 
 Usage:
-  dcw start <branch>      Create worktree, clone DB, copy private files, point the
+  dcw start [branch]      Create worktree, clone DB, copy private files, point the
                           worktree .env at its own DB + Redis namespace, then start
                           the server and a per-branch Celery worker.
                           If <branch> == $BASE (base), runs in $REPO on port $PORT_BASE
+                          No branch → arrow-key menu of startable branches
   dcw stop [branch]       Stop server + worker for a branch; keeps worktree + branch
                           No branch → arrow-key menu of running captains
   dcw status              List active captains (port, pid, alive, celery) + URLs
@@ -1306,8 +1564,10 @@ Usage:
                           Used by the shell function below to cd after 'dcw start'
   dcw abort [branch]      Stop server + worker → destroy worktree → free port → DROP DB
                           No branch → arrow-key menu of dcw worktrees
-  dcw logs <branch> [celery]
+  dcw logs [branch] [celery]
                           Tail the server log (default) or the branch's worker log
+                          No branch → arrow-key menu of RUNNING captains' logs
+                          (Space marks several to tail together)
 
   dcw celery start|restart|stop [branch]
                           Start/restart/stop a branch's worker (default branch: $BASE)

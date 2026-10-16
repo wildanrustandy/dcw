@@ -155,13 +155,15 @@ atau edit `~/.config/dcw/config`.
 ## Usage
 
 ```sh
-dcw start <branch>    # buat worktree + clone DB + salin file privat + namespace Redis
+dcw start [branch]    # buat worktree + clone DB + salin file privat + namespace Redis
                       # + jalankan server + worker Celery branch itu
+                      # tanpa <branch> → menu pilihan branch yang bisa di-start
                       # → shell otomatis cd ke worktree (lihat "Integrasi shell")
 dcw status            # daftar captain aktif (port, pid, hidup/mati, celery, URL)
 dcw list              # daftar semua git worktree
 dcw path <branch>     # cetak direktori branch (base → repo utama, lain → .worktrees/<branch>)
-dcw logs <branch> [celery]   # tail log server, atau log worker branch itu
+dcw logs [branch] [celery]   # tail log server, atau log worker branch itu
+                      # tanpa <branch> → menu pilihan log yang ada di $LOGDIR
 dcw stop [branch]     # stop server + worker (worktree + DB tetap)
                       # tanpa <branch> → menu pilihan captain yang jalan
 dcw abort [branch]    # hapus worktree + stop server/worker + DROP DB branch (konfirmasi)
@@ -171,10 +173,10 @@ dcw celery start|restart|stop [branch]   # kelola worker (default: base branch)
 dcw celery status     # semua worker: pid, hidup/mati, namespace Redis, log
 ```
 
-### stop / abort tanpa argumen (menu panah)
+### start / stop / abort / logs tanpa argumen (menu panah)
 
-`dcw stop` dan `dcw abort` tanpa `<branch>` membuka menu navigasi panah, jadi nama
-branch tidak perlu diingat atau diketik:
+`dcw start`, `dcw stop`, `dcw abort`, dan `dcw logs` tanpa `<branch>` membuka menu
+navigasi panah, jadi nama branch tidak perlu diingat atau diketik:
 
 ```
   BRANCH                                 PORT    STATUS
@@ -185,21 +187,60 @@ branch tidak perlu diingat atau diketik:
   up/down move   Space select   Enter confirm   q cancel
 ```
 
+`dcw start` menampilkan branch yang bisa di-start beserta statusnya:
+
+```
+  BRANCH                                 STATE     HEAD
+> [ ] Inventory                            running   a1b2c3d
+  [ ] feature-login                        local     9f8e7d6
+  [ ] remote-only-thing                    remote    4c5d6e7
+
+  up/down move   Space select   Enter confirm   q cancel
+```
+
+`dcw logs` memakai kolom yang sama tapi isinya log yang ada di disk:
+
+```
+  BRANCH                                 KIND    SIZE      AGE
+> [ ] inven-standard-rules                server  1.2M      4s
+  [ ] inven-standard-rules                celery  340K      12s
+  [ ] Inventory                           server  88K       2h
+
+  up/down move   Space select   Enter confirm   q cancel
+```
+
 | Tombol | Fungsi |
 |---|---|
 | `↑` / `↓` | pindah baris (berhenti di ujung, tidak memutar) |
-| `Space` | tandai/lepas baris — untuk stop/abort beberapa sekaligus |
+| `Space` | tandai/lepas baris — untuk stop/abort beberapa sekaligus, atau tail beberapa log sekaligus |
 | `Enter` | jalankan pilihan: baris bertanda, atau baris di bawah kursor kalau tidak ada yang ditandai |
 | `q` / `Esc` / `Ctrl-C` | tutup menu tanpa melakukan apa pun |
 | huruf/angka | filter: kursor melompat ke branch yang berawalan itu (`Backspace` menghapus) |
+| (`start`) `Space` | tidak dipakai — `start` jalan untuk satu branch (baris di bawah kursor) |
 
 - Kandidat `stop` = captain di registry port; yang hidup ditampilkan lebih dulu.
+- Kandidat `start` = semua branch lokal + branch yang hanya ada di `origin/`, kecuali
+  branch base. `STATE`: `running` (captain jalan), `stopped` (worktree ada tapi server
+  mati), `local` (branch lokal tanpa worktree), `remote` (hanya ada di origin → dibuat
+  dari `origin/<base>`). Yang `running` ditampilkan lebih dulu. `Enter` menjalankan
+  start untuk baris itu saja — `Space` tidak multi-select di sini (start beberapa
+  branch sekaligus tidak masuk akal, dan shell hanya bisa `cd` ke satu worktree).
 - Kandidat `abort` = worktree yang dikelola dcw saja (anak `$WT_DIR`); repo utama dan
   worktree di luar `$WT_DIR` tidak pernah ditawarkan.
+- Kandidat `logs` = log milik captain yang **sedang jalan** saja, diambil dari
+  registry port (`pid`-nya masih hidup). Log server (`<slug>.log`) dan
+  `<branch>-celery.log` yang cocok dengan captain itu yang ditawarkan, terbaru di atas.
+  Branch yang tidak jalan tidak muncul — menu ini menjawab "log captain mana yang mau
+  saya lihat", jadi branch mati hanya bikin bingung. Untuk log branch yang tidak jalan,
+  sebut namanya eksplisit: `dcw logs <branch>`. Beberapa log yang ditandai di-tail
+  bersamaan (`tail -f a b`).
+- Daftar digulirkan (windowed) supaya muat terminal: header tetap di atas dan hint
+  menampilkan `N-M of T` saat baris lebih banyak dari tinggi terminal.
 - `abort` beberapa target memakai satu konfirmasi gabungan (`Proceed? [y/N]`).
 - Menu butuh TTY: kalau stdin bukan TTY (script/cron), perintah keluar dengan usage +
   exit 2, bukan menggantung menunggu input. Di script, sebut branch-nya eksplisit.
-- `dcw stop <branch>` dan `dcw abort <branch>` dengan argumen tidak berubah perilakunya.
+- `dcw start <branch>`, `dcw stop <branch>`, `dcw abort <branch>`, dan
+  `dcw logs <branch> [celery]` dengan argumen tidak berubah perilakunya.
 
 Contoh:
 

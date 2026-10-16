@@ -284,10 +284,24 @@ case "$(basename "$LOGIN_SHELL")" in
 # other than `start` is passed straight through. Set DCW_BIN to point the
 # function at another dcw; `command dcw ...` bypasses it.
 dcw() {
-  local _dcw_bin="${DCW_BIN:-@BIN@}" _dcw_dir _dcw_rc
-  if [ "${1:-}" = start ] && [ -n "${2:-}" ]; then
-    _dcw_dir=$("$_dcw_bin" path "$2" 2>/dev/null) || _dcw_dir=""
-    "$_dcw_bin" "$@"; _dcw_rc=$?
+  local _dcw_bin="${DCW_BIN:-@BIN@}" _dcw_dir _dcw_rc _dcw_cdf=""
+  if [ "${1:-}" = start ]; then
+    if [ -n "${2:-}" ]; then
+      # Branch given: resolve the worktree before start creates it.
+      _dcw_dir=$("$_dcw_bin" path "$2" 2>/dev/null) || _dcw_dir=""
+      "$_dcw_bin" "$@"; _dcw_rc=$?
+    else
+      # No branch: the arrow-key picker chooses one, so let the binary tell us
+      # where to cd via a temp file (it is the only one that knows the choice).
+      _dcw_cdf=$(mktemp "${TMPDIR:-/tmp}/dcw-cd.XXXXXX") || _dcw_cdf=""
+      if [ -n "$_dcw_cdf" ]; then
+        DCW_CD_FILE="$_dcw_cdf" "$_dcw_bin" "$@"; _dcw_rc=$?
+        _dcw_dir=$(cat "$_dcw_cdf" 2>/dev/null) || _dcw_dir=""
+        rm -f "$_dcw_cdf"
+      else
+        "$_dcw_bin" "$@"; _dcw_rc=$?
+      fi
+    fi
     [ -n "$_dcw_dir" ] && [ -d "$_dcw_dir" ] && cd "$_dcw_dir"
     return "$_dcw_rc"
   fi
