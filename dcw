@@ -599,15 +599,15 @@ PYFREE
   _unlocked
 }
 
-# ── Interactive target picker (dcw stop / dcw abort / dcw logs, no argument) ─
+# ── Interactive target picker (dcw start / stop / abort / logs, no argument) ─
 # With no branch argument these commands open an arrow-key menu, so the target
-# does not have to be remembered. The candidate set differs per command: stop
-# lists captains from the port registry, abort lists the worktrees dcw actually
-# manages ($WT_DIR children only — abort never touches any other path), logs
-# lists the log files that exist in $LOGDIR. Up/down move, Space marks rows,
-# Enter confirms (a typed prefix picks the first matching branch), q cancels.
-# What each mode writes to stdout is its own value: stop/abort print branch
-# names, logs prints log paths (see value_idx in _pick_targets).
+# does not have to be remembered. The candidate set differs per command: start
+# and abort list the worktrees dcw actually manages ($WT_DIR children only —
+# start just the dead ones, abort all), stop lists captains from the port
+# registry, logs lists the log files that exist in $LOGDIR. Up/down move, Space
+# marks rows, Enter confirms (a typed prefix picks the first matching branch), q
+# cancels. What each mode writes to stdout is its own value: stop/abort/start
+# print branch names, logs prints log paths (see value_idx in _pick_targets).
 _abort_one() { # destroy worktree + port + worker + DB for ONE branch
   # Every step is non-fatal: this runs in a loop for multi-target abort, and one
   # target's failure (unreadable .env, dropdb refused) must not strand the rest.
@@ -661,7 +661,8 @@ for _, port, b, s in rows:
 PYSTOP
 }
 
-_pick_rows_abort() { # port<TAB>branch<TAB>head<TAB>dir — dcw worktrees only
+_pick_rows_worktrees() { # port<TAB>branch<TAB>head<TAB>dir<TAB>up|dead — dcw worktrees only
+  # One source for both menus: abort lists all of them, start only the dead ones.
   [ -d "$REPO/.git" ] || return 0
   python3 - "$REPO" "$WT_DIR" "$REG" <<'PYABT'
 import json, os, subprocess, sys
@@ -671,10 +672,21 @@ try:
 except Exception:
     d = {}
 bp = {}
+up = set()
 for port, info in d.items():
     b = info.get("branch") if isinstance(info, dict) else info
-    if b:
-        bp[b] = port
+    pid = info.get("pid", 0) if isinstance(info, dict) else 0
+    if not b:
+        continue
+    bp[b] = port
+    # 'Z' counts as dead: kill -0 succeeds for a zombie, so a process that died
+    # during startup would otherwise read as running.
+    try:
+        st = open("/proc/%d/stat" % int(pid)).read().rsplit(") ", 1)[1].split(" ", 1)[0]
+    except Exception:
+        st = ""
+    if st and st != "Z":
+        up.add(b)
 out = subprocess.run(["git", "-C", repo, "worktree", "list", "--porcelain"],
                      capture_output=True, text=True).stdout
 for block in [b for b in out.strip().split("\n\n") if b.strip()]:
@@ -689,8 +701,10 @@ for block in [b for b in out.strip().split("\n\n") if b.strip()]:
     if not branch:
         continue                  # detached: agent scratch worktrees, not dcw's
     if os.path.dirname(os.path.abspath(wt)) != os.path.abspath(wt_dir):
-        continue                  # outside $WT_DIR: abort would not touch it anyway
-    print(f"{bp.get(branch, '-')}\t{branch}\t{head}\t{os.path.relpath(wt, repo)}")
+        continue                  # outside $WT_DIR: not a dcw worktree
+    state = "up" if branch in up else "dead"
+    print("%s\t%s\t%s\t%s\t%s" % (bp.get(branch, "-"), branch, head,
+                                 os.path.relpath(wt, repo), state))
 PYABT
 }
 
@@ -777,73 +791,6 @@ for _mt, branch, kind, size, when, path in rows:
 PYLOG
 }
 
-_pick_rows_start() { # branch<TAB>state<TAB>head — branches that can be started
-  [ -d "$REPO/.git" ] || return 0
-  python3 - "$REPO" "$WT_DIR" "$REG" "$BASE" <<'PYSTART'
-import json, os, subprocess, sys
-repo, wt_dir, reg, base = sys.argv[1:5]
-
-def git(*a):
-    return subprocess.run(["git", "-C", repo] + list(a),
-                          capture_output=True, text=True).stdout
-
-# Branches that already have a dcw worktree, so we can mark them "worktree".
-have_wt = set()
-for line in git("worktree", "list", "--porcelain").splitlines():
-    if line.startswith("branch "):
-        have_wt.add(line[len("branch "):].replace("refs/heads/", ""))
-
-try:
-    d = json.load(open(reg))
-except Exception:
-    d = {}
-port_of = {}
-for port, info in d.items():
-    b = info.get("branch") if isinstance(info, dict) else info
-    if b:
-        port_of[b] = port
-
-# Candidate branches: local heads, plus remote-only ones (start will create them
-# from origin/<base> anyway, but a remote branch named the same is a real branch
-# the user may mean). The base branch itself is excluded — starting it is a
-# no-arg fast path that needs no choose-from-a-list.
-local = set()
-for line in git("for-each-ref", "--format=%(refname:short)", "refs/heads/").splitlines():
-    if line.strip():
-        local.add(line.strip())
-remote = set()
-for name in git("for-each-ref", "--format=%(refname:short)",
-                "refs/remotes/origin/").splitlines():
-    name = name.strip()
-    if not name or name in ("origin/HEAD", "origin"):
-        continue
-    b = name[len("origin/"):]
-    if b == "HEAD":
-        continue
-    remote.add(b)
-
-# HEAD commit for the label: a local ref's short sha, else the remote's.
-def short_sha(ref):
-    return git("rev-parse", "--short", ref).strip() or "-"
-
-rows = []
-for b in sorted(local | remote):
-    if b == base:
-        continue
-    if b in local:
-        state = "running" if b in port_of else ("stopped" if b in have_wt else "local")
-        ref = b
-    else:
-        state = "remote"
-        ref = "origin/" + b
-    rows.append((0 if state == "running" else 1, b, state, short_sha(ref)))
-# Ones already up first, then by branch name.
-rows.sort(key=lambda r: (r[0], r[1]))
-for _pri, b, state, head in rows:
-    print("%s\t%s\t%s" % (b, state, head))
-PYSTART
-}
-
 _pick_targets() { # <stop|abort|logs|start> -> selected values on stdout; 1 = cancelled
   local mode="$1" rows n value_idx=1 name_idx=1
   # value_idx = the field the picker prints (stop/abort: branch name at 1,
@@ -858,9 +805,11 @@ _pick_targets() { # <stop|abort|logs|start> -> selected values on stdout; 1 = ca
   elif [ "$mode" = logs ]; then
     _pick_rows_logs > "$rows"
   elif [ "$mode" = start ]; then
-    _pick_rows_start > "$rows"
+    # Same rows as abort, filtered to the dead ones: starting a branch that has
+    # no worktree yet stays an explicit `dcw start <branch>` (it creates one).
+    _pick_rows_worktrees | awk -F'\t' '$5 == "dead" { print $2 "\tdead\t" $3 }' > "$rows"
   else
-    _pick_rows_abort > "$rows"
+    _pick_rows_worktrees > "$rows"
   fi
   n=$(awk 'NF' "$rows" | wc -l)
   if [ "$n" -eq 0 ]; then
@@ -870,7 +819,7 @@ _pick_targets() { # <stop|abort|logs|start> -> selected values on stdout; 1 = ca
     elif [ "$mode" = logs ]; then
       echo "no running captains — nothing to tail (start one with 'dcw start')" >&2
     elif [ "$mode" = start ]; then
-      echo "no startable branches in $REPO (base '$BASE' excluded) — nothing to start" >&2
+      echo "no dead dcw worktrees under $WT_DIR — nothing to start (use 'dcw start <branch>' to create one)" >&2
     else
       echo "no dcw worktrees under $WT_DIR — nothing to abort" >&2
     fi
@@ -1035,7 +984,7 @@ cmd="${1:-help}"; shift || true
 case "$cmd" in
   start)
     if [ -z "${1:-}" ]; then
-      # No branch given: pick from the branches that can be started. Interactive
+      # No branch given: pick from the dcw worktrees that are not running. Interactive
       # only — a non-TTY (script, cron) would just block on the menu.
       if [ ! -t 0 ]; then
         echo "usage: dcw start <branch>   (run it in a terminal to pick from a list)" >&2
@@ -1557,7 +1506,7 @@ Usage:
                           worktree .env at its own DB + Redis namespace, then start
                           the server and a per-branch Celery worker.
                           If <branch> == $BASE (base), runs in $REPO on port $PORT_BASE
-                          No branch → arrow-key menu of startable branches
+                          No branch → arrow-key menu of dead dcw worktrees
   dcw stop [branch]       Stop server + worker for a branch; keeps worktree + branch
                           No branch → arrow-key menu of running captains
   dcw status              List active captains (port, pid, alive, celery) + URLs
