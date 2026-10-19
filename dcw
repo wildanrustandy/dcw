@@ -391,7 +391,8 @@ _celery_start() { # start the branch's worker (idempotent)
     cd "$root" || exit 1
     # shellcheck disable=SC1091
     [ -f "$VENV/bin/activate" ] && source "$VENV/bin/activate"
-    nohup "$celery_bin" -A hmx worker \
+    # setsid: own session, so a dying terminal/pty host cannot kill the worker
+    setsid nohup "$celery_bin" -A hmx worker \
       --loglevel="$CELERY_LOGLEVEL" \
       --concurrency="$CELERY_CONCURRENCY" \
       --hostname="dcw-$(_slug "$branch")@%h" \
@@ -488,12 +489,13 @@ _start_server() { # start runserver in dir on port, track pid
   cd "$django_root"
   # shellcheck disable=SC1091
   [ -f "$VENV/bin/activate" ] && source "$VENV/bin/activate"
+  # setsid: own session, so a dying terminal/pty host cannot kill the server
   if [ -x "$VENV/bin/hmx" ]; then          # DevSpace-style: hmx CLI from hmx_license
-    nohup "$VENV/bin/hmx" runserver "127.0.0.1:$port" > "$log" 2>&1 &
+    setsid nohup "$VENV/bin/hmx" runserver "127.0.0.1:$port" > "$log" 2>&1 &
   elif command -v hmx >/dev/null 2>&1; then
-    nohup hmx runserver "127.0.0.1:$port" > "$log" 2>&1 &
+    setsid nohup hmx runserver "127.0.0.1:$port" > "$log" 2>&1 &
   else                                     # local fallback: plain manage.py
-    nohup python3 manage.py runserver "127.0.0.1:$port" --noreload > "$log" 2>&1 &
+    setsid nohup python3 manage.py runserver "127.0.0.1:$port" --noreload > "$log" 2>&1 &
   fi
   local pid=$!
   disown
