@@ -700,7 +700,8 @@ for block in [b for b in out.strip().split("\n\n") if b.strip()]:
             head = line[len("HEAD "):][:9]
     if not branch:
         continue                  # detached: agent scratch worktrees, not dcw's
-    if os.path.dirname(os.path.abspath(wt)) != os.path.abspath(wt_dir):
+    # Prefix, not dirname: 'feat/x' lives in $WT_DIR/feat/x, one level deeper.
+    if not os.path.abspath(wt).startswith(os.path.abspath(wt_dir) + os.sep):
         continue                  # outside $WT_DIR: not a dcw worktree
     state = "up" if branch in up else "dead"
     print("%s\t%s\t%s\t%s\t%s" % (bp.get(branch, "-"), branch, head,
