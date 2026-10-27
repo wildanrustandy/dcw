@@ -457,6 +457,32 @@ _celery_stop() { # stop the branch's worker (keeps the branch/worktree)
   echo "  celery:  stopped (pid $pid)"
 }
 
+_sync_claude_md() { # force the worktree's CLAUDE.md to mirror $REPO's local copy
+  # This clone keeps CLAUDE.md as a REGULAR file hidden with skip-worktree, while
+  # git still tracks a symlink to /shared/CLAUDE.md (DevSpace convention). Every
+  # fresh `git worktree add` materialises that symlink, so a new worktree would
+  # show /shared's content instead of this machine's copy — and the copy-if-
+  # missing loop above never fires because the symlink already exists. Sync
+  # explicitly: whenever the worktree file is missing, a symlink, or differs,
+  # replace it with $REPO's file and hide the divergence with skip-worktree so
+  # the worktree's git status stays clean too. Local-only: nothing is committed.
+  local wt="$1"
+  local src="$REPO/CLAUDE.md" dst="$wt/CLAUDE.md" exclude
+  [ -f "$src" ] && [ ! -L "$src" ] || return 0   # no local regular CLAUDE.md
+  if [ -f "$dst" ] && [ ! -L "$dst" ] && cmp -s "$src" "$dst"; then
+    return 0                                     # already an identical regular file
+  fi
+  rm -f "$dst"
+  cp "$src" "$dst"
+  exclude=$(git -C "$wt" rev-parse --git-path info/exclude 2>/dev/null || true)
+  case "$exclude" in /*) ;; *) exclude="$wt/$exclude" ;; esac
+  if [ -n "$exclude" ] && [ -f "$exclude" ]; then
+    grep -Fxq "/CLAUDE.md" "$exclude" || printf '/%s\n' "CLAUDE.md" >> "$exclude"
+  fi
+  git -C "$wt" update-index --skip-worktree CLAUDE.md 2>/dev/null || true
+  echo "  copy:    $dst <- $src (skip-worktree)"
+}
+
 _copy_private_paths() { # copy agent/config files repo -> worktree (once), git-exclude them
   local branch="$1"
   local wt="$WT_DIR/$branch"
@@ -1095,6 +1121,7 @@ case "$cmd" in
 
     # Per-worktree DB + private files (like DevSpace dcw)
     _copy_private_paths "$branch"
+    _sync_claude_md "$wt"
     _db_clone "$branch"
     _set_worktree_db_json "$branch"
     _set_worktree_env_db "$branch"
