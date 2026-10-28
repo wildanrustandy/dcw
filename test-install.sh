@@ -131,7 +131,9 @@ is  "function block not duplicated" "$(grep -c 'dcw shell integration' "$G/.zshe
 
 echo "== 8. the function cds into the worktree after 'dcw start' =="
 # A stub binary: `path` answers with $FAKE_WT, `start` prints and exits $FAKE_RC.
-F="$D/fakebin"; mkdir -p "$F" "$D/wt/foo"
+# foo has an `hmx` subdir (the Django project) so the wrapper lands in hmx;
+# bar is root-only so the fallback-to-root path is still exercised.
+F="$D/fakebin"; mkdir -p "$F" "$D/wt/foo/hmx" "$D/wt/bar"
 cat > "$F/dcw" <<'FAKE'
 #!/usr/bin/env bash
 case "${1:-}" in
@@ -142,10 +144,11 @@ esac
 FAKE
 chmod +x "$F/dcw"
 run_fn() { HOME="$G" DCW_BIN="$F/dcw" FAKE_WT="$1" FAKE_RC="$2" "$ZSH_BIN" -lic "$3" 2>/dev/null; }
-is  "cds into the worktree"        "$(run_fn "$D/wt/foo" 0 'dcw start foo >/dev/null; pwd')" "$D/wt/foo"
+is  "cds into hmx when present"    "$(run_fn "$D/wt/foo" 0 'dcw start foo >/dev/null; pwd')" "$D/wt/foo/hmx"
+is  "cds into worktree root w/o hmx" "$(run_fn "$D/wt/bar" 0 'dcw start bar >/dev/null; pwd')" "$D/wt/bar"
 is  "no cd when the dir is absent" "$(run_fn "$D/wt/gone" 0 'dcw start foo >/dev/null; pwd')" "$START_PWD"
 is  "exit code passes through"     "$(run_fn "$D/wt/foo" 3 'dcw start foo >/dev/null; echo rc=$?')" "rc=3"
-is  "still cds after a failed start" "$(run_fn "$D/wt/foo" 3 'dcw start foo >/dev/null; pwd')" "$D/wt/foo"
+is  "still cds after a failed start" "$(run_fn "$D/wt/foo" 3 'dcw start foo >/dev/null; pwd')" "$D/wt/foo/hmx"
 has "other subcommands pass through" "$(run_fn "$D/wt/foo" 0 'dcw status')" "fake status"
 is  "other subcommands do not cd"  "$(run_fn "$D/wt/foo" 0 'dcw status >/dev/null; pwd')" "$START_PWD"
 is  "bare 'start' is passed through" "$(run_fn "$D/wt/foo" 0 'dcw start >/dev/null; pwd')" "$START_PWD"

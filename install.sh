@@ -302,7 +302,15 @@ dcw() {
         "$_dcw_bin" "$@"; _dcw_rc=$?
       fi
     fi
-    [ -n "$_dcw_dir" ] && [ -d "$_dcw_dir" ] && cd "$_dcw_dir"
+    # cd into <dir>/hmx (the Django project subdir) when it exists, else the
+    # worktree/repo root. HMX places manage.py under hmx/, so dropping the
+    # user there after start is the useful landing spot. Works for both cd
+    # sources above: `dcw path` (explicit branch) and $DCW_CD_FILE (picker).
+    if [ -n "$_dcw_dir" ] && [ -d "$_dcw_dir/hmx" ]; then
+      cd "$_dcw_dir/hmx"
+    elif [ -n "$_dcw_dir" ] && [ -d "$_dcw_dir" ]; then
+      cd "$_dcw_dir"
+    fi
     return "$_dcw_rc"
   fi
   "$_dcw_bin" "$@"

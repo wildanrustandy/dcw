@@ -83,7 +83,9 @@ file rc yang sama dengan blok PATH (zsh/bash):
 
 - Hanya `start <branch>` yang menambah `cd`; semua subcommand lain diteruskan apa adanya.
 - Target `cd` didapat dari subcommand baru `dcw path <branch>` — berguna manual juga:
-  `cd "$(dcw path mybranch)"`.
+  `cd "$(dcw path mybranch)"`. **Setelah `dcw start`, fungsi masuk satu langkah lagi ke
+  subfolder `hmx`** (direktori proyek Django; `dcw path` tetap mengembalikan root). Jika
+  folder `hmx` belum ada, fallback-nya adalah root worktree/repo.
 - `cd` hanya terjadi kalau direktorinya benar-benar ada, dan exit code `dcw start`
   diteruskan apa adanya.
 - `DCW_BIN=/path/lain/dcw` mengarahkan fungsi ke binary lain; `command dcw ...`
@@ -105,13 +107,14 @@ Installer juga memasang dua fungsi venv dari `shell/venv.sh` di repo (disalin ke
 | `venvhere` | activate venv **tanpa** pindah direktori — tetap di tempat Anda sekarang |
 
 `venvhere` dipasangkan dengan `dcw start`: setelah `dcw start <branch>` Anda sudah
-berada di worktree, lalu `venvhere` mengaktifkan venv tanpa memindahkan Anda lagi:
+berada di `hmx` (subfolder proyek) di dalam worktree, lalu `venvhere` mengaktifkan
+venv tanpa memindahkan Anda lagi:
 
 ```sh
 ~/repo $ dcw start mybranch
 ✓ captain started: mybranch
-~/repo/.worktrees/mybranch $ venvhere
-venvhere: aktif -> Python 3.14.4 @ /home/you/repo/.worktrees/mybranch
+~/repo/.worktrees/mybranch/hmx $ venvhere
+venvhere: aktif -> Python 3.14.4 @ /home/you/repo/.worktrees/mybranch/hmx
 ```
 
 Urutan pencarian venv `venvhere`: argumen (`venvhere /path/venv`) → `.venv` di
@@ -158,7 +161,7 @@ atau edit `~/.config/dcw/config`.
 dcw start [branch]    # buat worktree + clone DB + salin file privat + namespace Redis
                       # + jalankan server + worker Celery branch itu
                       # tanpa <branch> → menu pilihan branch yang bisa di-start
-                      # → shell otomatis cd ke worktree (lihat "Integrasi shell")
+                      # → shell otomatis cd ke folder hmx di worktree (lihat "Integrasi shell")
 dcw status            # daftar captain aktif (port, pid, hidup/mati, celery, URL)
 dcw list              # daftar semua git worktree
 dcw path <branch>     # cetak direktori branch (base → repo utama, lain → .worktrees/<branch>)
