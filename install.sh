@@ -204,6 +204,10 @@ cp "$SRC" "$BIN_DIR/.dcw.incoming.$$"
 chmod +x "$BIN_DIR/.dcw.incoming.$$"
 mv -f "$BIN_DIR/.dcw.incoming.$$" "$BIN_DIR/dcw"
 echo "✓ installed: $BIN_DIR/dcw"
+# Keep the checkout location next to the binary so `dcw update` can fetch its
+# own source without guessing the user's project repo or resetting their config.
+printf '%s\n' "$(cd "$(dirname "$SRC")" && pwd)" > "$BIN_DIR/.dcw-source.incoming.$$"
+mv -f "$BIN_DIR/.dcw-source.incoming.$$" "$BIN_DIR/.dcw-source"
 
 # ── write user config ─────────────────────────────────────────────
 CONFIG_DIR="$HOME/.config/dcw"

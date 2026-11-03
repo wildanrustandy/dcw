@@ -81,6 +81,7 @@ echo "== 3. --bin auto-pick (~/.local/bin already on the login PATH) =="
 out=$(HOME="$A" bash "$SRC" "${INSTALL_ARGS[@]}" 2>&1)
 has "picks ~/.local/bin" "$out" "bin:        $A/.local/bin"
 is  "binary installed there" "$([ -x "$A/.local/bin/dcw" ] && echo yes)" "yes"
+is  "update source recorded" "$(< "$A/.local/bin/.dcw-source")" "$(cd "$(dirname "$SRC")" && pwd)"
 has "flags the stale function (installed for $A/bin)" "$out" "pointing at another binary"
 
 echo "== 4. bash host: escalate past ~/.bashrc (a login bash never reads it) =="

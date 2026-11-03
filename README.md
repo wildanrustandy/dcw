@@ -21,6 +21,26 @@ git clone <repo-ini> ~/dcw
 ~/dcw/install.sh
 ```
 
+Untuk memperbarui **dcw** setelah ada push dari tim, cukup jalankan:
+
+```sh
+dcw update
+```
+
+Perintah ini melakukan `git pull --ff-only` pada checkout dcw tempat instalasi
+berasal, lalu mengganti binary terpasang dan helper venv. Konfigurasi lokal
+(`~/.config/dcw/config`) tidak ditimpa. Jika checkout memiliki perubahan lokal,
+tidak punya upstream, atau pull gagal, update berhenti tanpa mengganti binary.
+Setelah berhasil, `dcw update` menampilkan judul commit baru sejak HEAD sebelum
+update (urut lama ke baru). Jika sudah terbaru, muncul pesan berbahasa Inggris
+"dcw is already up to date. No changes needed." dan binary/helper tidak disalin ulang.
+Ini ringkasan pesan commit, **bukan changelog rilis** yang ditulis manual.
+Instalasi lama perlu menjalankan `~/dcw/install.sh` sekali untuk mencatat lokasi
+checkout (periksa kembali pilihan path/port karena installer menulis konfigurasi).
+Perubahan fungsi shell di installer belum otomatis diterapkan oleh `dcw update`;
+jalankan installer kembali jika rilis mengubah integrasi shell. Ini **tidak**
+memperbarui repo project HMX; update HMX tetap dilakukan terpisah.
+
 Installer **interaktif** — akan menanyakan:
 
 1. Folder project HMX (default `~/dev/hmx-002`)
@@ -163,6 +183,7 @@ dcw start [branch]    # buat worktree + clone DB + salin file privat + namespace
                       # tanpa <branch> → menu pilihan branch yang bisa di-start
                       # → shell otomatis cd ke folder hmx di worktree (lihat "Integrasi shell")
 dcw status            # daftar captain aktif (port, pid, hidup/mati, celery, URL)
+dcw update            # tarik perubahan terbaru repo dcw dan perbarui binary terpasang
 dcw list              # daftar semua git worktree
 dcw path <branch>     # cetak direktori branch (base → repo utama, lain → .worktrees/<branch>)
 dcw logs [branch] [celery]   # tail log server, atau log worker branch itu

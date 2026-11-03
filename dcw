@@ -28,6 +28,7 @@
 #                        with no <branch>, pick a log from an arrow-key menu
 #   dcw celery start|restart|stop|status [branch]
 #                        manage a branch's worker (default: base branch)
+#   dcw update           fast-forward the dcw checkout and refresh the installed binary
 #
 # Isolation: each worktree gets HMX_INSTANCE_NAMESPACE=<base ns>-<db name>, and HMX
 # derives every Redis key from it (hmx:<sha256(ns)>:{celery,celery-result,cache,
@@ -1009,6 +1010,50 @@ PYPICK
 cmd="${1:-help}"; shift || true
 
 case "$cmd" in
+  update)
+    if [ "$#" -ne 0 ]; then
+      echo "usage: dcw update" >&2; exit 2
+    fi
+    bin_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+    source_file="$bin_dir/.dcw-source"
+    if [ ! -f "$source_file" ]; then
+      echo "dcw update: installation source unknown; run install.sh from the dcw checkout once" >&2
+      exit 1
+    fi
+    IFS= read -r source_dir < "$source_file" || true
+    if [ ! -f "$source_dir/install.sh" ] || [ ! -f "$source_dir/dcw" ] ||
+       [ "$(git -C "$source_dir" rev-parse --show-toplevel 2>/dev/null || true)" != "$source_dir" ]; then
+      echo "dcw update: dcw checkout not found: $source_dir" >&2; exit 1
+    fi
+    if [ -n "$(git -C "$source_dir" status --porcelain --untracked-files=no)" ]; then
+      echo "dcw update: checkout has local changes; save or commit them before updating" >&2; exit 1
+    fi
+    if ! git -C "$source_dir" rev-parse --verify '@{upstream}' >/dev/null 2>&1; then
+      echo "dcw update: branch has no upstream; configure tracking first" >&2; exit 1
+    fi
+    old_head=$(git -C "$source_dir" rev-parse HEAD)
+    echo "Checking for dcw updates from $source_dir ..."
+    git -C "$source_dir" pull --ff-only || exit 1
+    new_head=$(git -C "$source_dir" rev-parse HEAD)
+    if [ "$old_head" = "$new_head" ]; then
+      echo "dcw is already up to date. No changes needed."
+      exit 0
+    fi
+    # No installer re-run: that would overwrite the user's project/venv/port config.
+    tmp="$bin_dir/.dcw.incoming.$$"
+    if ! cp "$source_dir/dcw" "$tmp" || ! chmod +x "$tmp" || ! mv -f "$tmp" "$bin_dir/dcw"; then
+      rm -f "$tmp"
+      echo "dcw update: failed to install the new binary" >&2; exit 1
+    fi
+    helper="$HOME/.config/dcw/shell/venv.sh"
+    if [ -f "$source_dir/shell/venv.sh" ] && [ -d "$(dirname "$helper")" ]; then
+      cp "$source_dir/shell/venv.sh" "$helper"
+    fi
+    echo "dcw updated: $(git -C "$source_dir" rev-parse --short HEAD)"
+    echo "New commits (subjects):"
+    git -C "$source_dir" log --format='  %h %s' --reverse "$old_head..$new_head"
+    echo "Note: shell integration changes require reinstalling with install.sh (check your configuration)."
+    ;;
   start)
     if [ -z "${1:-}" ]; then
       # No branch given: pick from the dcw worktrees that are not running. Interactive
@@ -1538,6 +1583,7 @@ Usage:
   dcw stop [branch]       Stop server + worker for a branch; keeps worktree + branch
                           No branch → arrow-key menu of running captains
   dcw status              List active captains (port, pid, alive, celery) + URLs
+  dcw update              Fast-forward dcw's own repo and refresh its installed binary
   dcw list                Show all git worktrees (branch, port, dir)
   dcw path <branch>       Print the dir of a branch (base -> $REPO; worktree -> $WT_DIR/<branch>)
                           Used by the shell function below to cd after 'dcw start'
