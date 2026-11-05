@@ -281,7 +281,24 @@ dcw start <base-branch>   # base branch → langsung di repo utama, port 5200
 
 Base branch dideteksi dari `origin/HEAD` (branch default yang dideklarasikan repo,
 sama seperti `dev-captain`); fallback ke branch yang sedang aktif di repo, lalu `main`.
-Untuk memaksa: `DEV_CAPTAIN_BASE=<branch> dcw start <branch>`.
+Untuk memaksa hanya pada satu pemanggilan: `DEV_CAPTAIN_BASE=<branch> dcw start <branch>`.
+
+Untuk mengganti default branch yang dipakai `dcw start` tanpa argumen (atau sebagai
+base branch bagi worktree baru), arahkan `origin/HEAD` ke branch remote yang diinginkan:
+
+```sh
+git remote set-head origin <branch>
+git symbolic-ref --short refs/remotes/origin/HEAD  # verifikasi, contoh: origin/Fundamental-New
+dcw start <nama-worktree-baru>
+```
+
+Contoh: `git remote set-head origin Fundamental-New` membuat `dcw` memakai
+`origin/Fundamental-New` sebagai base untuk branch/worktree baru. Perintah ini hanya
+mengubah symbolic ref lokal `origin/HEAD`; tidak mengganti URL remote atau berpindah
+branch di working tree utama. Jika branch worktree yang diminta sudah ada lokal,
+`dcw` akan memakai branch yang ada apa adanya, bukan membuat ulang dari base baru.
+Perubahan `origin/HEAD` ini lokal pada clone masing-masing dan tidak ikut tersimpan di
+remote.
 
 ### Titik awal branch baru
 
