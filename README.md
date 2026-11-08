@@ -64,6 +64,28 @@ Non-interaktif:
 `--bin DIR` menyalin binary ke `DIR/dcw` (default tidak menyalin — cukup ganti binary
 build Anda sendiri). Menyetel ulang kapan saja: jalankan `dcw init` lagi.
 
+## Rilis (prebuilt binary)
+
+Instalasi `curl` dan `dcw update` sama-sama mengunduh asset `dcw-<os>-<arch>` dari
+base URL rilis (default: permalink GitLab release). Agar keduanya bekerja, lampirkan
+binary per-target ke release GitLab dengan nama persis:
+
+| Asset | Target |
+|---|---|
+| `dcw-linux-x86_64` | Linux x86_64 |
+| `dcw-linux-aarch64` | Linux ARM64 |
+| `dcw-macos-x86_64` | macOS Intel |
+| `dcw-macos-aarch64` | macOS Apple Silicon |
+
+`<os>`/`<arch>` mengikuti `std::env::consts` Rust (`linux`, `macos`, `x86_64`,
+`aarch64`) — bukan `darwin`/`amd64`/`arm64`. Build per-target bisa via CI atau
+cross-compile; contoh satu target (host):
+
+```sh
+cargo build --release                    # target host (mis. linux/x86_64)
+cp target/release/dcw dcw-linux-x86_64   # ganti nama ke konvensi di atas
+```
+
 ## Usage
 
 ```
@@ -83,6 +105,21 @@ dcw update              unduh binary release terbaru, lalu ganti binary terpasan
 dcw init                setup/inisialisasi ulang: lihat config + tanya reconfigure
 dcw uninstall           hapus dcw dari mesin (binary + config + blok rc)
 ```
+
+### `dcw update` — self-update
+
+`dcw update` mengunduh binary prebuilt rilis terbaru untuk OS/arch mesin ini lalu
+**menukarnya secara atomik** dengan binary yang sedang berjalan — tanpa git checkout
+dan tanpa Rust toolchain. Butuh `curl` (atau fallback `wget`) di mesin target.
+
+URL di-resolve dengan urutan prioritas:
+
+1. `DCW_UPDATE_URL`  — URL lengkap binary (hosting override)
+2. `DCW_UPDATE_BASE` — base URL tempat nama asset ditempel
+3. bawaan            — GitLab release permalink proyek ini
+
+Nama asset adalah `dcw-<os>-<arch>` (mis. `dcw-linux-x86_64`) — sama persis dengan
+yang dihasilkan `install.sh` dari `uname` dan `std::env::consts` di Rust.
 
 `start`/`stop`/`abort`/`logs`/`jump` tanpa argumen membuka **menu navigasi panah**
 (`Space` menandai beberapa baris, `Enter` konfirmasi, `q` batal) seperti dcw. Menu butuh
@@ -171,6 +208,8 @@ Precedence: **env per-call** > `~/.config/dcw/config` > default bawaan
 | `DCW_CELERY_QUEUES` | `interactive,import,export,scheduled,notifications,csv,data_import,demo_pool,celery` | daftar queue |
 | `DCW_CELERY_CONCURRENCY` | `2` | `--concurrency` worker |
 | `DCW_CELERY_LOGLEVEL` | `INFO` | loglevel worker |
+| `DCW_UPDATE_URL` | GitLab release permalink | URL lengkap binary untuk `dcw update` |
+| `DCW_UPDATE_BASE` | GitLab release permalink | base URL tempat `dcw-<os>-<arch>` ditempel |
 
 ## State
 
