@@ -14,19 +14,31 @@ Setiap *feature branch* proyek HMX (Django + Celery) mendapat lingkungan dev yan
 
 State tersimpan di `~/.dev-captain/` (registry port, log, pidfile worker).
 
-## Build
+## Install (curl)
+
+Cara termudah — **tanpa clone repo dan tanpa Rust toolchain**:
 
 ```sh
-export PATH="$HOME/.cargo/bin:$PATH"   # kalau cargo belum di PATH shell Anda
-cd worktree-creator
-cargo build --release      # -> target/release/dcw
+curl -fsSL https://git.hashmicro.com/wildanhashmicro/dcw/-/raw/main/install.sh | bash
 ```
 
-## Install
+Installer mengunduh binary prebuilt untuk OS/arch mesin Anda, memasangnya ke
+`~/.local/bin/dcw`, lalu menjalankan `dcw init` non-interaktif (pakai default).
+Untuk konfigurasi ulang repo/venv/port: `dcw init`.
+
+Override saat install:
+
+| Env | Keterangan |
+|---|---|
+| `DCW_UPDATE_URL` | URL lengkap binary (lewati deteksi OS/arch) |
+| `DCW_UPDATE_BASE` | base URL tempat nama asset ditempel (default: GitLab release permalink) |
+| `DCW_BIN_DIR` | direktori install (default: `~/.local/bin`) |
+
+## Build dari source (developer)
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"   # kalau cargo belum di PATH shell Anda
-cd worktree-creator
+cd dcw
 cargo build --release      # -> target/release/dcw
 
 # pasang + konfigurasi interaktif (mirip dcw install.sh):
@@ -50,8 +62,7 @@ Non-interaktif:
 ```
 
 `--bin DIR` menyalin binary ke `DIR/dcw` (default tidak menyalin — cukup ganti binary
-build Anda sendiri). `--bin` juga mencatat lokasi checkout sebagai `DIR/.dcw-source`
-agar `dcw update` tahu sumbernya. Menyetel ulang kapan saja: jalankan `dcw init` lagi.
+build Anda sendiri). Menyetel ulang kapan saja: jalankan `dcw init` lagi.
 
 ## Usage
 
@@ -68,7 +79,7 @@ dcw list                daftar semua worktree (nama worktree, bukan branch) + st
 dcw abort [branch]      hapus worktree + stop + DROP DB (konfirmasi). tanpa → menu
 dcw logs [branch] [celery]  tail log server atau worker. tanpa → menu panah (multi-select)
 dcw celery start|restart|stop|status [branch]   kelola worker (default: base branch)
-dcw update              pull --ff-only checkout dcw, rebuild, ganti binary terpasang
+dcw update              unduh binary release terbaru, lalu ganti binary terpasang
 dcw init                setup/inisialisasi ulang: lihat config + tanya reconfigure
 dcw uninstall           hapus dcw dari mesin (binary + config + blok rc)
 ```

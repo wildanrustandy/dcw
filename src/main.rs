@@ -36,7 +36,7 @@ enum Commands {
     /// Manage a branch's Celery worker
     #[command(subcommand)]
     Celery(CeleryCmd),
-    /// Fast-forward dcw's own checkout and refresh the binary
+    /// Download the latest prebuilt release and replace the running binary
     Update,
     /// Re-initialize: show current config, ask to reconfigure, then install (like dcw install.sh)
     #[command(alias = "setup")]
@@ -129,13 +129,15 @@ fn main() {
     std::process::exit(code);
 }
 
-/// Self-update, faithful to dcw's `update`: locate the checkout from a `.dcw-source`
-/// file next to the installed binary (written by the installer), `git pull --ff-only`,
-/// rebuild, and atomically replace the running binary.
+/// Self-update for a curl-installed binary: download the latest prebuilt release for
+/// this OS/arch and atomically replace the running binary. No git checkout and no Rust
+/// toolchain are needed on the target machine.
+///
+/// The download URL is resolved from, in order:
+///   1. `DCW_UPDATE_URL`  — the full URL of the binary (hosting override)
+///   2. `DCW_UPDATE_BASE` — a base URL the per-platform asset name is appended to
+///   3. the built-in GitLab release permalink for this project
 fn update(_cfg: &config::Config) -> i32 {
-    use std::path::PathBuf;
-
-    // Locate the source checkout the binary was installed from.
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(e) => {
@@ -143,118 +145,93 @@ fn update(_cfg: &config::Config) -> i32 {
             return 1;
         }
     };
-    let bin_dir = exe.parent().map(PathBuf::from).unwrap_or_default();
-    let source_file = bin_dir.join(".dcw-source");
-    let Ok(source_dir) = std::fs::read_to_string(&source_file) else {
-        eprintln!("dcw update: installation source unknown; run the installer from the checkout once");
-        return 1;
+    let bin_dir = match exe.parent() {
+        Some(p) => p.to_path_buf(),
+        None => {
+            eprintln!("dcw update: cannot determine install directory");
+            return 1;
+        }
     };
-    let source_dir = PathBuf::from(source_dir.trim());
 
-    if !source_dir.join("Cargo.toml").is_file() || !source_dir.join("src/main.rs").is_file() {
-        eprintln!("dcw update: dcw checkout not found: {}", source_dir.display());
+    let url = update_url();
+    let tmp = bin_dir.join(format!(".dcw.incoming.{}", std::process::id()));
+    println!("Downloading dcw from {url} ...");
+    if !download(&url, &tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        eprintln!(
+            "dcw update: download failed (see above); re-run the installer or set DCW_UPDATE_URL"
+        );
         return 1;
     }
-    // The checkout must itself be a git repo root.
-    let top = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&source_dir)
-        .args(["rev-parse", "--show-toplevel"])
+
+    // Make it executable and read its version (best effort) before swapping.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
+    }
+    let new_version = std::process::Command::new(&tmp)
+        .arg("--version")
         .output()
+        .ok()
+        .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_default();
-    if top != source_dir.to_string_lossy() {
-        eprintln!("dcw update: dcw checkout not found: {}", source_dir.display());
-        return 1;
-    }
 
-    // Refuse to overwrite local edits.
-    let dirty = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&source_dir)
-        .args(["status", "--porcelain", "--untracked-files=no"])
-        .output()
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(true);
-    if dirty {
-        eprintln!("dcw update: checkout has local changes; save or commit them before updating");
-        return 1;
-    }
-
-    // Require an upstream, else pull --ff-only has nothing to fast-forward.
-    let has_upstream = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&source_dir)
-        .args(["rev-parse", "--verify", "@{upstream}"])
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !has_upstream {
-        eprintln!("dcw update: branch has no upstream; configure tracking first");
-        return 1;
-    }
-
-    let old_head = git_rev(&source_dir, "HEAD");
-    println!("Checking for dcw updates from {} ...", source_dir.display());
-    let pull = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&source_dir)
-        .args(["pull", "--ff-only"])
-        .status();
-    if !matches!(pull, Ok(s) if s.success()) {
-        eprintln!("dcw update: git pull --ff-only failed");
-        return 1;
-    }
-    let new_head = git_rev(&source_dir, "HEAD");
-    if old_head == new_head {
-        println!("dcw is already up to date. No changes needed.");
-        return 0;
-    }
-
-    // Rebuild with the toolchain on PATH, then atomically swap the binary.
-    eprintln!("Rebuilding dcw from {} ...", source_dir.display());
-    let build = std::process::Command::new("cargo")
-        .arg("build")
-        .arg("--release")
-        .arg("--manifest-path")
-        .arg(source_dir.join("Cargo.toml"))
-        .status();
-    if !matches!(build, Ok(s) if s.success()) {
-        eprintln!("dcw update: cargo build --release failed");
-        return 1;
-    }
-    let incoming = source_dir.join("target/release/dcw");
-    let tmp = bin_dir.join(format!(".dcw.incoming.{}", std::process::id()));
-    if std::fs::copy(&incoming, &tmp).is_err() || std::fs::rename(&tmp, &exe).is_err() {
+    if std::fs::rename(&tmp, &exe).is_err() {
         let _ = std::fs::remove_file(&tmp);
-        eprintln!("dcw update: failed to install the new binary");
+        eprintln!("dcw update: failed to replace the running binary");
         return 1;
     }
-    println!("dcw updated: {}", &new_head[..new_head.len().min(7)]);
-    println!("New commits (subjects):");
-    let log = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&source_dir)
-        .args(["log", "--format=  %h %s", "--reverse", &format!("{old_head}..{new_head}")])
-        .output();
-    if let Ok(o) = log {
-        if !o.stdout.is_empty() {
-            print!("{}", String::from_utf8_lossy(&o.stdout));
-        }
+
+    if new_version.is_empty() {
+        println!("dcw updated.");
+    } else {
+        println!("dcw updated ({new_version}).");
     }
     0
 }
 
-fn git_rev(source_dir: &std::path::Path, rev: &str) -> String {
-    std::process::Command::new("git")
-        .arg("-C")
-        .arg(source_dir)
-        .args(["rev-parse", rev])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default()
+/// Resolve the download URL for this platform's prebuilt binary. Asset names are
+/// `dcw-<os>-<arch>` using Rust's `std::env::consts` values (e.g. `dcw-linux-x86_64`),
+/// which `install.sh` reproduces from `uname`.
+fn update_url() -> String {
+    if let Ok(full) = std::env::var("DCW_UPDATE_URL") {
+        if !full.is_empty() {
+            return full;
+        }
+    }
+    let asset = format!("dcw-{}-{}", std::env::consts::OS, std::env::consts::ARCH);
+    let base = std::env::var("DCW_UPDATE_BASE").unwrap_or_else(|_| {
+        "https://git.hashmicro.com/wildanhashmicro/dcw/-/releases/permalink/latest/downloads"
+            .to_string()
+    });
+    format!("{}/{}", base.trim_end_matches('/'), asset)
+}
+
+/// Download `url` to `dest`, preferring curl and falling back to wget. Returns true
+/// only when a client reported success AND a non-empty file landed at `dest`.
+fn download(url: &str, dest: &std::path::Path) -> bool {
+    let curl = std::process::Command::new("curl")
+        .args(["-fsSL", "--retry", "2", "-o"])
+        .arg(dest)
+        .arg(url)
+        .status();
+    if matches!(curl, Ok(s) if s.success() && file_nonempty(dest)) {
+        return true;
+    }
+    let wget = std::process::Command::new("wget")
+        .args(["-q", "-O"])
+        .arg(dest)
+        .arg(url)
+        .status();
+    matches!(wget, Ok(s) if s.success() && file_nonempty(dest))
+}
+
+fn file_nonempty(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.len() > 0)
+        .unwrap_or(false)
 }
 
 fn celery_status_all(cfg: &config::Config) {
