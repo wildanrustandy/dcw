@@ -19,7 +19,7 @@ State tersimpan di `~/.dev-captain/` (registry port, log, pidfile worker).
 Cara termudah — **tanpa clone repo dan tanpa Rust toolchain**:
 
 ```sh
-curl -fsSL https://git.hashmicro.com/wildanhashmicro/dcw/-/raw/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/wildanrustandy/dcw/main/install.sh | bash
 ```
 
 Installer mengunduh binary prebuilt untuk OS/arch mesin Anda, memasangnya ke
@@ -31,7 +31,7 @@ Override saat install:
 | Env | Keterangan |
 |---|---|
 | `DCW_UPDATE_URL` | URL lengkap binary (lewati deteksi OS/arch) |
-| `DCW_UPDATE_BASE` | base URL tempat nama asset ditempel (default: GitLab release permalink) |
+| `DCW_UPDATE_BASE` | base URL tempat nama asset ditempel (default: GitHub latest release) |
 | `DCW_BIN_DIR` | direktori install (default: `~/.local/bin`) |
 
 ## Build dari source (developer)
@@ -67,8 +67,8 @@ build Anda sendiri). Menyetel ulang kapan saja: jalankan `dcw init` lagi.
 ## Rilis (prebuilt binary)
 
 Instalasi `curl` dan `dcw update` sama-sama mengunduh asset `dcw-<os>-<arch>` dari
-base URL rilis (default: permalink GitLab release). Agar keduanya bekerja, lampirkan
-binary per-target ke release GitLab dengan nama persis:
+base URL rilis (default: GitHub latest release). Agar keduanya bekerja, lampirkan
+binary per-target ke release GitHub dengan nama persis:
 
 | Asset | Target |
 |---|---|
@@ -116,7 +116,7 @@ URL di-resolve dengan urutan prioritas:
 
 1. `DCW_UPDATE_URL`  — URL lengkap binary (hosting override)
 2. `DCW_UPDATE_BASE` — base URL tempat nama asset ditempel
-3. bawaan            — GitLab release permalink proyek ini
+3. bawaan            — GitHub latest release proyek ini
 
 Nama asset adalah `dcw-<os>-<arch>` (mis. `dcw-linux-x86_64`) — sama persis dengan
 yang dihasilkan `install.sh` dari `uname` dan `std::env::consts` di Rust.
@@ -208,8 +208,8 @@ Precedence: **env per-call** > `~/.config/dcw/config` > default bawaan
 | `DCW_CELERY_QUEUES` | `interactive,import,export,scheduled,notifications,csv,data_import,demo_pool,celery` | daftar queue |
 | `DCW_CELERY_CONCURRENCY` | `2` | `--concurrency` worker |
 | `DCW_CELERY_LOGLEVEL` | `INFO` | loglevel worker |
-| `DCW_UPDATE_URL` | GitLab release permalink | URL lengkap binary untuk `dcw update` |
-| `DCW_UPDATE_BASE` | GitLab release permalink | base URL tempat `dcw-<os>-<arch>` ditempel |
+| `DCW_UPDATE_URL` | GitHub latest release | URL lengkap binary untuk `dcw update` |
+| `DCW_UPDATE_BASE` | GitHub latest release | base URL tempat `dcw-<os>-<arch>` ditempel |
 
 ## State
 

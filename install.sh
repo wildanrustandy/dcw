@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # install.sh — one-shot installer for dcw (the Rust rewrite).
 #
-#   curl -fsSL https://git.hashmicro.com/wildanhashmicro/dcw/-/raw/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/wildanrustandy/dcw/main/install.sh | bash
 #
 # Downloads the prebuilt binary for this OS/arch and runs `dcw init`. No git clone
 # and no Rust toolchain are required on the target machine.
 #
 # Overrides:
 #   DCW_UPDATE_URL   full URL of the binary (skips OS/arch detection)
-#   DCW_UPDATE_BASE  base URL the asset name is appended to (default: GitLab release permalink)
+#   DCW_UPDATE_BASE  base URL the asset name is appended to (default: GitHub latest release)
 #   DCW_BIN_DIR      install directory (default: ~/.local/bin)
 set -euo pipefail
 
@@ -27,7 +27,7 @@ esac
 asset="dcw-${os}-${arch}"
 
 # --- resolve download URL ---
-default_base="https://git.hashmicro.com/wildanhashmicro/dcw/-/releases/permalink/latest/downloads"
+default_base="https://github.com/wildanrustandy/dcw/releases/latest/download"
 if [ -n "${DCW_UPDATE_URL:-}" ]; then
   url="$DCW_UPDATE_URL"
 else

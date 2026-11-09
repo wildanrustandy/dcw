@@ -136,7 +136,7 @@ fn main() {
 /// The download URL is resolved from, in order:
 ///   1. `DCW_UPDATE_URL`  — the full URL of the binary (hosting override)
 ///   2. `DCW_UPDATE_BASE` — a base URL the per-platform asset name is appended to
-///   3. the built-in GitLab release permalink for this project
+///   3. the built-in GitHub latest-release download for this project
 fn update(_cfg: &config::Config) -> i32 {
     let exe = match std::env::current_exe() {
         Ok(e) => e,
@@ -203,7 +203,7 @@ fn update_url() -> String {
     }
     let asset = format!("dcw-{}-{}", std::env::consts::OS, std::env::consts::ARCH);
     let base = std::env::var("DCW_UPDATE_BASE").unwrap_or_else(|_| {
-        "https://git.hashmicro.com/wildanhashmicro/dcw/-/releases/permalink/latest/downloads"
+        "https://github.com/wildanrustandy/dcw/releases/latest/download"
             .to_string()
     });
     format!("{}/{}", base.trim_end_matches('/'), asset)
