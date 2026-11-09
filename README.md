@@ -67,23 +67,28 @@ build Anda sendiri). Menyetel ulang kapan saja: jalankan `dcw init` lagi.
 ## Rilis (prebuilt binary)
 
 Instalasi `curl` dan `dcw update` sama-sama mengunduh asset `dcw-<os>-<arch>` dari
-base URL rilis (default: GitHub latest release). Agar keduanya bekerja, lampirkan
-binary per-target ke release GitHub dengan nama persis:
+base URL rilis (default: GitHub latest release). Asset per-target:
 
-| Asset | Target |
-|---|---|
-| `dcw-linux-x86_64` | Linux x86_64 |
-| `dcw-linux-aarch64` | Linux ARM64 |
-| `dcw-macos-x86_64` | macOS Intel |
-| `dcw-macos-aarch64` | macOS Apple Silicon |
+| Asset | Target | Cara bangun |
+|---|---|---|
+| `dcw-linux-x86_64` | Linux x86_64 | otomatis (GitHub Actions, saat push tag `v*`) |
+| `dcw-linux-aarch64` | Linux ARM64 | build native |
+| `dcw-macos-x86_64` | macOS Intel | build di Mac |
+| `dcw-macos-aarch64` | macOS Apple Silicon | build di Mac |
 
 `<os>`/`<arch>` mengikuti `std::env::consts` Rust (`linux`, `macos`, `x86_64`,
-`aarch64`) — bukan `darwin`/`amd64`/`arm64`. Build per-target bisa via CI atau
-cross-compile; contoh satu target (host):
+`aarch64`) — bukan `darwin`/`amd64`/`arm64`.
+
+Binary **Linux x86_64** di-build otomatis oleh `.github/workflows/release.yml` setiap
+push tag `v*`. Runner **macOS tidak tersedia di akun GitHub free**, jadi binary mac
+di-build di Mac lalu di-upload manual ke release terbaru:
 
 ```sh
-cargo build --release                    # target host (mis. linux/x86_64)
-cp target/release/dcw dcw-linux-x86_64   # ganti nama ke konvensi di atas
+# di Mac (M1/arm64):
+git clone https://github.com/wildanrustandy/dcw.git && cd dcw
+cargo build --release
+cp target/release/dcw dcw-macos-aarch64
+gh release upload <tag> dcw-macos-aarch64   # ganti <tag>, mis. v0.1.1
 ```
 
 ## Usage
