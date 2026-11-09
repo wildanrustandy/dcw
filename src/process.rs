@@ -46,23 +46,36 @@ pub fn spawn_detached(dir: &Path, log: &Path, program: &str, args: &[String]) ->
 }
 
 /// Is pid alive? Returns false for dead, zombie, and non-existent processes.
-/// Reads /proc/<pid>/stat state letter (Linux): a zombie ("Z") counts as dead, since
-/// kill(pid, 0) succeeds for zombies.
+///
+/// Linux reads /proc/<pid>/stat's state letter: a zombie ("Z") counts as dead, since
+/// kill(pid, 0) succeeds for zombies. macOS/BSD has no procfs, so it falls back to
+/// kill(pid, 0): ESRCH means gone; zombies there are rare and auto-reaped.
 pub fn pid_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
     }
-    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => {
-            // state is field 3; it follows the ")" that ends the comm field (comm may
-            // contain spaces and parens, so split on the last ") ").
-            let state = stat.rsplit(") ").next().and_then(|rest| rest.split(' ').next());
-            match state {
-                Some("Z") | Some("X") | None => false,
-                Some(_) => true,
+    #[cfg(target_os = "linux")]
+    {
+        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => {
+                // state is field 3; it follows the ")" that ends the comm field (comm
+                // may contain spaces/parens, so split on the last ") ").
+                let state = stat.rsplit(") ").next().and_then(|rest| rest.split(' ').next());
+                match state {
+                    Some("Z") | Some("X") | None => false,
+                    Some(_) => true,
+                }
             }
+            Err(_) => false,
         }
-        Err(_) => false,
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        match kill(Pid::from_raw(pid), None) {
+            Ok(_) => true,
+            Err(nix::errno::Errno::ESRCH) => false,
+            Err(_) => true, // e.g. EPERM: process exists but not owned by us
+        }
     }
 }
 

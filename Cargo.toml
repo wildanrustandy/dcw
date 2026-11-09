@@ -1,6 +1,6 @@
 [package]
 name = "dcw"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "dcw — worktree + port + Django server + Celery lifecycle"
 license = "MIT"

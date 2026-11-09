@@ -53,6 +53,13 @@ else
 fi
 chmod +x "$tmp"
 
+# macOS Gatekeeper: strip the quarantine attribute curl sets, else the unsigned
+# binary is blocked on first run (note: notarization is still absent — first run may
+# still need "Security & Privacy > Open Anyway").
+if [ "$os" = macos ] && command -v xattr >/dev/null 2>&1; then
+  xattr -d com.apple.quarantine "$tmp" 2>/dev/null || true
+fi
+
 echo "→ installing to $bin_dir/dcw (via dcw init --bin)"
 "$tmp" init --yes --bin "$bin_dir"
 
