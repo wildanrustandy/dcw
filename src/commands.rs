@@ -131,7 +131,7 @@ fn kill_port(cfg: &Config, port: u16) {
 /// PIDs listening on a TCP port via lsof.
 fn lsof_listeners(port: u16) -> Vec<i32> {
     let out = std::process::Command::new("lsof")
-        .args(["-tiTCP:", &port.to_string(), "-sTCP:LISTEN"])
+        .args([&format!("-tiTCP:{port}"), "-sTCP:LISTEN"])
         .output();
     match out {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
