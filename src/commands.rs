@@ -18,6 +18,55 @@ pub fn port_of(cfg: &Config, branch: &str) -> Option<u16> {
     None
 }
 
+/// A dcw target resolved from a user-supplied name OR branch. The identity is the
+/// worktree's DIRECTORY name (stable across `git switch`), not its checked-out
+/// branch — a worktree can be switched to another branch at any time, while its
+/// name keeps pointing at the same directory, port, logs, and worker.
+pub struct Target {
+    pub name: String,
+    pub dir: PathBuf,
+    pub branch: Option<String>,
+}
+
+/// Resolve `arg` (a worktree name, or a branch checked out inside one) to a Target.
+/// The base branch resolves to the main checkout itself.
+pub fn find_target(cfg: &Config, arg: &str) -> Option<Target> {
+    if arg == cfg.base {
+        return Some(Target {
+            name: cfg.base.clone(),
+            dir: cfg.repo.clone(),
+            branch: git::current_branch(&cfg.repo),
+        });
+    }
+    for wt in git::list_worktrees(&cfg.repo) {
+        let name = worktree_name(cfg, &wt);
+        if name != arg && wt.branch.as_deref() != Some(arg) {
+            continue;
+        }
+        let branch = wt.branch.clone();
+        let dir = wt.dir.clone();
+        return Some(Target { name, dir, branch });
+    }
+    // A worktree git does not list (detached, or not yet registered): fall back to
+    // the path dcw would have created for it.
+    let dir = cfg.dir_for(arg);
+    if dir.is_dir() {
+        let branch = git::current_branch(&dir);
+        return Some(Target {
+            name: arg.to_string(),
+            dir,
+            branch,
+        });
+    }
+    None
+}
+
+/// Port recorded for a target: by its worktree name first (the key dcw allocated the
+/// port under), then by its currently checked-out branch (older registry entries).
+pub fn port_for(cfg: &Config, t: &Target) -> Option<u16> {
+    port_of(cfg, &t.name).or_else(|| t.branch.as_deref().and_then(|b| port_of(cfg, b)))
+}
+
 /// The live server pid recorded for a port (None if dead/absent).
 fn pid_for_port(cfg: &Config, port: u16) -> Option<i32> {
     let reg = registry::load(&cfg.reg_file);
@@ -187,11 +236,11 @@ fn start_server(cfg: &Config, tree: &Path, port: u16, branch: &str) -> Option<i3
     Some(pid)
 }
 
-pub fn server_log(cfg: &Config, branch: &str) -> PathBuf {
-    if branch == cfg.base {
+pub fn server_log(cfg: &Config, key: &str) -> PathBuf {
+    if key == cfg.base {
         cfg.logs_dir.join("main.log")
     } else {
-        cfg.logs_dir.join(format!("{}.log", cfg.slug(branch)))
+        cfg.logs_dir.join(format!("{}.log", cfg.slug(key)))
     }
 }
 
@@ -290,15 +339,25 @@ pub fn create(cfg: &Config, branch: Option<String>) -> i32 {
             return 1;
         }
     };
-    bring_up(cfg, &branch, &wt, port, false)
+    let target = Target {
+        name: branch.clone(),
+        dir: wt,
+        branch: Some(branch.clone()),
+    };
+    bring_up(cfg, &target, port, false)
 }
 
 /// ── start ────────────────────────────────────────────────────────
 /// Start server + worker for an EXISTING worktree (or the base branch, which runs
 /// in $REPO itself). Never creates a worktree — that is `dcw new`'s job.
-pub fn start(cfg: &Config, branch: Option<String>) -> i32 {
+///
+/// `name` is the WORKTREE name (its directory under .worktrees/), not the branch
+/// checked out in it: a worktree keeps its name, port, logs, and worker when you
+/// `git switch` inside it. A branch name is still accepted and resolved to the
+/// worktree that has it checked out.
+pub fn start(cfg: &Config, name: Option<String>) -> i32 {
     ensure_dirs(cfg);
-    let branch = match branch {
+    let name = match name {
         Some(b) => b,
         None => return crate::picker::start_pick(cfg),
     };
@@ -307,7 +366,13 @@ pub fn start(cfg: &Config, branch: Option<String>) -> i32 {
         return 2;
     }
 
-    if branch == cfg.base {
+    let Some(target) = find_target(cfg, &name) else {
+        eprintln!("error: no worktree named '{name}' — create it first: dcw new {name}");
+        eprintln!("       'dcw list' shows every existing worktree");
+        return 2;
+    };
+
+    if target.dir == cfg.repo {
         // $REPO serves whatever branch it has checked out; say so when that differs.
         if let Some(head) = git::current_branch(&cfg.repo) {
             if head != cfg.base {
@@ -315,125 +380,141 @@ pub fn start(cfg: &Config, branch: Option<String>) -> i32 {
                 eprintln!("         run 'git -C {} switch {}' to serve {}.", cfg.repo.display(), cfg.base, cfg.base);
             }
         }
-        return bring_up(cfg, &branch, &cfg.repo, cfg.port_base, true);
+        return bring_up(cfg, &target, cfg.port_base, true);
     }
 
-    let wt = cfg.dir_for(&branch);
-    if !wt.exists() {
-        eprintln!("error: no worktree for {branch} — create it first: dcw new {branch}");
-        return 2;
-    }
-    let port = match port_alloc(cfg, &branch) {
+    let port = match port_alloc(cfg, &target.name) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {e}");
             return 1;
         }
     };
-    bring_up(cfg, &branch, &wt, port, false)
+    bring_up(cfg, &target, port, false)
 }
 
 /// Allocate/announce the port and start server + worker for an existing tree.
-/// Shared by `new` (after creation) and `start`.
-fn bring_up(cfg: &Config, branch: &str, wt: &Path, port: u16, base: bool) -> i32 {
+/// Shared by `new` (after creation) and `start`. The target's NAME keys the port,
+/// the log file, the celery pidfile, and the registry entry.
+fn bring_up(cfg: &Config, t: &Target, port: u16, base: bool) -> i32 {
     if let Some(pid) = pid_for_port(cfg, port) {
-        println!("✓ {branch} already running (pid {pid}) on port {port}");
-        println!("  preview: {}", cfg.url_for(port, branch));
-        let _ = celery::celery_start(cfg, branch, false);
+        println!("✓ {} already running (pid {pid}) on port {port}", t.name);
+        println!("  preview: {}", cfg.url_for(port, &t.name));
+        let _ = celery::celery_start(cfg, &t.name, false);
         return 0;
     }
-    let log = server_log(cfg, branch);
-    match start_server(cfg, wt, port, branch) {
+    let log = server_log(cfg, &t.name);
+    match start_server(cfg, &t.dir, port, &t.name) {
         Some(pid) => {
             if base {
-                println!("✓ captain started: {branch} (base)");
-                println!("  dir:     {}", wt.display());
+                println!("✓ captain started: {} (base)", t.name);
+                println!("  dir:     {}", t.dir.display());
             } else {
-                println!("✓ captain started: {branch}");
-                println!("  worktree: {}", wt.display());
+                println!("✓ captain started: {}", t.name);
+                println!("  worktree: {}", t.dir.display());
+                if let Some(branch) = &t.branch {
+                    println!("  branch:  {branch}");
+                }
             }
             println!("  port:    {port}  (pid {pid})");
-            println!("  preview: {}", cfg.url_for(port, branch));
+            println!("  preview: {}", cfg.url_for(port, &t.name));
             println!("  log:     {}", log.display());
         }
         None => {
             println!("⚠ port {port} reserved; server NOT started (spawn manually when ready)");
         }
     }
-    let _ = celery::celery_start(cfg, branch, false);
+    let _ = celery::celery_start(cfg, &t.name, false);
     0
 }
 
 /// ── stop ─────────────────────────────────────────────────────────
-pub fn stop(cfg: &Config, branch: Option<String>) -> i32 {
+pub fn stop(cfg: &Config, name: Option<String>) -> i32 {
     ensure_dirs(cfg);
-    let branch = match branch {
+    let name = match name {
         Some(b) => b,
         None => return crate::picker::stop_pick(cfg),
     };
-    let port = match port_of(cfg, &branch) {
+    let Some(target) = find_target(cfg, &name) else {
+        eprintln!("error: no worktree named '{name}' (see 'dcw list')");
+        return 2;
+    };
+    let port = match port_for(cfg, &target) {
         Some(p) => p,
-        None if branch == cfg.base => cfg.port_base,
+        None if target.dir == cfg.repo => cfg.port_base,
         None => {
-            println!("no captain running for {branch}");
-            celery::celery_stop(cfg, &branch);
+            println!("no captain running for {}", target.name);
+            celery::celery_stop(cfg, &target.name);
             return 0;
         }
     };
     kill_port(cfg, port);
-    celery::celery_stop(cfg, &branch);
-    println!("✓ stopped {branch} (port {port}) — worktree/branch left intact");
+    celery::celery_stop(cfg, &target.name);
+    println!("✓ stopped {} (port {port}) — worktree/branch left intact", target.name);
     0
 }
 
 /// ── restart ──────────────────────────────────────────────────────
-/// Stop then start a branch's server + worker. The port stays sticky (stop
+/// Stop then start a worktree's server + worker. The port stays sticky (stop
 /// clears the registry pid but keeps the entry), and the worktree/DB are
-/// untouched. Restarting a branch that isn't running just starts it.
-pub fn restart(cfg: &Config, branch: Option<String>) -> i32 {
+/// untouched. Restarting a worktree that isn't running just starts it.
+pub fn restart(cfg: &Config, name: Option<String>) -> i32 {
     ensure_dirs(cfg);
-    let branch = match branch {
+    let name = match name {
         Some(b) => b,
         None => return crate::picker::stop_pick(cfg),
     };
-    let code = stop(cfg, Some(branch.clone()));
+    let code = stop(cfg, Some(name.clone()));
     if code != 0 {
         return code;
     }
-    start(cfg, Some(branch))
+    start(cfg, Some(name))
 }
 
 /// ── abort ────────────────────────────────────────────────────────
-pub fn abort(cfg: &Config, branch: Option<String>) -> i32 {
+pub fn abort(cfg: &Config, name: Option<String>) -> i32 {
     ensure_dirs(cfg);
-    let branch = match branch {
+    let name = match name {
         Some(b) => b,
         None => return crate::picker::abort_pick(cfg),
     };
-    if branch == cfg.base {
-        eprintln!("error: cannot abort '{branch}' — that would destroy {}. Use 'dcw stop {branch}' to just stop the server.", cfg.repo.display());
+    let Some(target) = find_target(cfg, &name) else {
+        eprintln!("error: no worktree named '{name}' (see 'dcw list')");
+        return 2;
+    };
+    if target.dir == cfg.repo {
+        eprintln!("error: cannot abort '{}' — that would destroy {}. Use 'dcw stop {}' to just stop the server.", target.name, cfg.repo.display(), target.name);
         return 2;
     }
-    let wt = cfg.dir_for(&branch);
-    let port = port_of(cfg, &branch);
+    let port = port_for(cfg, &target);
     let port_str = port.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
 
-    print_destroy_summary(cfg, &[(branch.clone(), port_str)]);
+    print_destroy_summary(cfg, &[(target.name.clone(), port_str)]);
     if !confirm_cached() {
         println!("aborted");
         return 1;
     }
     println!();
-    abort_one(cfg, &branch, &wt, port);
+    abort_one(cfg, &target.name, &target.dir, port);
     0
 }
 
 /// Print the "this will be destroyed" summary (shared by single- and multi-target
-/// abort so both read the same way). Takes (branch, port-as-string) pairs.
+/// abort so both read the same way). Takes (worktree-name, port-as-string) pairs.
 pub fn print_destroy_summary(cfg: &Config, targets: &[(String, String)]) {
     println!("Will destroy:");
-    for (branch, port) in targets {
-        println!("  {branch}  →  {}  (port {port})", cfg.dir_for(branch).display());
+    for (name, port) in targets {
+        let dir = match find_target(cfg, name) {
+            Some(t) => t.dir,
+            None => cfg.dir_for(name),
+        };
+        let branch = git::current_branch(&dir);
+        println!("  {name}  →  {}  (port {port})", dir.display());
+        if let Some(b) = branch {
+            if &b != name {
+                println!("     worktree is on branch '{b}' (that branch ref is kept)");
+            }
+        }
     }
     println!("NO merge.");
 }
@@ -450,37 +531,50 @@ fn confirm_cached() -> bool {
     matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
-/// Destroy worktree + port + worker + DB for one branch (every step non-fatal, so a
+/// Destroy worktree + port + worker + DB for one worktree (every step non-fatal, so a
 /// multi-target abort keeps going if one target fails).
-pub fn abort_one(cfg: &Config, branch: &str, wt: &Path, port: Option<u16>) {
+///
+/// `name` is the WORKTREE name (dcw's identity, and the DB name). The branch ref
+/// that a `git switch` put in the worktree is NOT deleted — that is the user's work,
+/// not something dcw created — only the ref matching the worktree name is.
+pub fn abort_one(cfg: &Config, name: &str, wt: &Path, port: Option<u16>) {
     if let Some(port) = port {
         kill_port(cfg, port);
         port_free(cfg, &port.to_string());
     }
-    celery::celery_stop(cfg, branch);
+    celery::celery_stop(cfg, name);
+    // Capture what is checked out before the worktree goes away.
+    let checked_out = git::current_branch(wt);
     if wt.exists() && !git::worktree_remove(&cfg.repo, wt) {
         eprintln!("dcw: warning: could not remove worktree {}", wt.display());
     }
-    git::branch_delete(&cfg.repo, branch);
-    db::db_drop(cfg, branch);
-    println!("✓ aborted {branch}");
+    git::branch_delete(&cfg.repo, name);
+    if let Some(branch) = checked_out {
+        if branch != name {
+            println!("  kept branch '{branch}' (checked out in the worktree; not created by dcw)");
+        }
+    }
+    db::db_drop(cfg, name);
+    println!("✓ aborted {name}");
 }
 
 /// ── list ─────────────────────────────────────────────────────────
-/// One source of truth: git worktrees, annotated with each branch's runtime state
+/// One source of truth: git worktrees, annotated with each worktree's runtime state
 /// (port, pid, running/dead, celery) from the registry. Rendered as a box table
-/// like dcw's `status`.
+/// like dcw's `status`. The WORKTREE column is the identity dcw uses everywhere
+/// (directory name → port, logs, worker); BRANCH shows what is checked out in it
+/// right now, which can differ after a `git switch` inside the worktree.
 pub fn list(cfg: &Config) {
     if !cfg.repo.join(".git").exists() {
         eprintln!("error: {} is not a git repo", cfg.repo.display());
         return;
     }
     let reg = registry::load(&cfg.reg_file);
-    // branch -> (port, pid, status, celery). The registry is keyed by branch,
-    // but a worktree's checked-out branch can CHANGE after creation (git switch
-    // inside the worktree) while its directory name stays stable — and the
-    // directory name is what dcw uses as the worktree's identity elsewhere
-    // (dir_for, logs). So look entries up by branch first, then by name.
+    // key -> (port, pid, status, celery). Registry keys are worktree names (they
+    // were the branch names at creation time); a `git switch` inside the worktree
+    // changes the checked-out branch but never the name, so the name is the key
+    // that keeps matching. Fall back to the checked-out branch for entries written
+    // before this rule.
     let runtime: std::collections::HashMap<String, (String, i32, String, String)> = reg
         .iter()
         .filter_map(|(port, info)| {
@@ -504,38 +598,42 @@ pub fn list(cfg: &Config) {
 
     let mut entries: Vec<((u8, u16), Vec<String>)> = Vec::new();
     for wt in &worktrees {
-        // Runtime state is keyed by BRANCH in the registry, but the column shows
-        // the WORKTREE's own name (its directory), not the branch ref.
-        let branch = wt.branch.clone().unwrap_or_default();
         let name = worktree_name(cfg, wt);
-        // Match the registry entry by checked-out branch OR by worktree name:
-        // a `git switch` inside the worktree changes the branch but not the
-        // name dcw created it under (dir_for/registry key).
+        // Look the runtime state up by WORKTREE NAME first, then by whatever branch
+        // is checked out in it.
+        let branch = wt.branch.clone().unwrap_or_default();
         let (port, pid, status, cel) = runtime
-            .get(&branch)
-            .or_else(|| runtime.get(&name))
+            .get(&name)
+            .or_else(|| runtime.get(&branch))
             .cloned()
             .unwrap_or_else(|| ("-".into(), 0, "dead".into(), "-".into()));
         let port_n = port.parse::<u16>().ok();
         let pid_str = if pid > 0 { pid.to_string() } else { "-".into() };
-        // Preview URL like `dcw status`; only meaningful when the branch has a port.
+        // Preview URL like `dcw status`; a port's URL is fixed by its number.
         let url = match port_n {
-            Some(p) => cfg.url_for(p, &branch),
+            Some(p) => cfg.url_for(p, &name),
             None => "-".into(),
+        };
+        // Always show what is checked out: after a `git switch` it differs from the
+        // name, and hiding it when it matches makes the column look broken.
+        let branch_str = if branch.is_empty() {
+            "(detached)".into()
+        } else {
+            branch
         };
         // Sort: up first, then by port ascending ("-" ports fall to the end).
         let key = (if status == "up" { 0 } else { 1 }, port_n.unwrap_or(u16::MAX));
-        entries.push((key, vec![name, pid_str, status, cel, url]));
+        entries.push((key, vec![name, branch_str, pid_str, status, cel, url]));
     }
     entries.sort_by_key(|(k, _)| *k);
     let rows: Vec<Vec<String>> = entries.into_iter().map(|(_, r)| r).collect();
-    render_box(&["WORKTREE", "PID", "STATUS", "CELERY", "URL"], &rows);
+    render_box(&["WORKTREE", "BRANCH", "PID", "STATUS", "CELERY", "URL"], &rows);
 }
 
 /// A worktree's own name: its directory under $WT_DIR (e.g. `PRD_INV_00296`, or
 /// `feat/x` for a slashed branch), `(repo)` for the main checkout, or the full
 /// directory path when the worktree lives outside $WT_DIR.
-fn worktree_name(cfg: &Config, wt: &git::Worktree) -> String {
+pub fn worktree_name(cfg: &Config, wt: &git::Worktree) -> String {
     if wt.dir == cfg.repo {
         return "(repo)".to_string();
     }
@@ -611,16 +709,26 @@ pub fn jump(cfg: &Config) -> i32 {
 }
 
 /// ── logs ─────────────────────────────────────────────────────────
-pub fn logs(cfg: &Config, branch: Option<String>, celery_flag: Option<String>) -> i32 {
+/// `arg` is a WORKTREE name (its directory), like every other per-target command;
+/// a branch name is accepted and resolved to the worktree that has it checked out.
+pub fn logs(cfg: &Config, arg: Option<String>, celery_flag: Option<String>) -> i32 {
     ensure_dirs(cfg);
-    let branch = match branch {
+    let name = match arg {
         Some(b) => b,
         None => return crate::picker::logs_pick(cfg),
     };
+    // `(repo)` / base resolve to the base checkout, whose identity is the base name.
+    let name = match find_target(cfg, &name) {
+        Some(t) => t.name,
+        None => {
+            eprintln!("error: no worktree named '{name}' (see 'dcw list')");
+            return 2;
+        }
+    };
     let log = if celery_flag.as_deref() == Some("celery") {
-        celery::logfile(cfg, &branch)
+        celery::logfile(cfg, &name)
     } else {
-        server_log(cfg, &branch)
+        server_log(cfg, &name)
     };
     if !log.exists() {
         eprintln!("no log at {}", log.display());

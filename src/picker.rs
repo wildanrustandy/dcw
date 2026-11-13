@@ -11,19 +11,38 @@ use crate::{commands, git, process};
 use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{read, Event, KeyCode, KeyEvent, KeyModifiers};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use std::io::Write;
+use std::path::PathBuf;
 
 struct Row {
     display: String, // pre-formatted columns
     value: String,   // the field handed back on confirm (branch name, or log path)
 }
 
-/// A dcw-managed worktree with its runtime state.
+/// A dcw-managed worktree with its runtime state. `name` is the worktree's own
+/// identity (its directory name) — that is what the menus show and hand back, so a
+/// `git switch` inside the worktree never changes which row you pick.
 struct WtRow {
-    branch: String,
+    name: String,
+    branch: String, // what is checked out right now (may differ from the name)
+    dir: PathBuf,
     port: String,
     status: String, // "up" or "down"
+}
+
+impl WtRow {
+    /// The worktree name, plus the checked-out branch when it differs — so a
+    /// switched worktree is visible at a glance without losing the identity.
+    fn label(&self) -> String {
+        if self.branch.is_empty() || self.branch == self.name {
+            self.name.clone()
+        } else {
+            format!("{} → {}", self.name, self.branch)
+        }
+    }
 }
 
 fn status_rank(s: &str) -> u8 {
@@ -35,24 +54,45 @@ fn port_num(s: &str) -> u16 {
 }
 
 /// Every dcw-managed worktree, sorted up-first then by port, with port + status.
+/// Registry entries are looked up by WORKTREE NAME first, then by the checked-out
+/// branch (older entries); a switched worktree therefore still shows its own port
+/// and status.
 fn worktree_rows(cfg: &Config) -> Vec<WtRow> {
     let reg = registry::load(&cfg.reg_file);
-    // branch -> (port, pid)
-    let mut by_branch: std::collections::HashMap<String, (String, i32)> = std::collections::HashMap::new();
+    // branch/name -> (port, pid)
+    let mut by_key: std::collections::HashMap<String, (String, i32)> = std::collections::HashMap::new();
     for (port, info) in reg.iter() {
-        by_branch.insert(info.branch.clone(), (port.clone(), info.pid));
+        if info.branch.is_empty() {
+            continue;
+        }
+        by_key
+            .entry(info.branch.clone())
+            .or_insert_with(|| (port.clone(), info.pid));
     }
 
     let mut rows = Vec::new();
     for wt in git::list_worktrees(&cfg.repo) {
-        let Some(branch) = wt.branch.clone() else { continue };
         // only dcw-managed worktrees (inside .worktrees/)
         if !git::is_managed_worktree(&wt.dir, &cfg.wt_dir) {
             continue;
         }
-        let (port, pid) = by_branch.get(&branch).cloned().unwrap_or_else(|| ("-".into(), 0));
-        let status = if pid > 0 && process::pid_alive(pid) { "up" } else { "down" };
-        rows.push(WtRow { branch, port, status: status.to_string() });
+        let name = crate::commands::worktree_name(cfg, &wt);
+        let branch = wt.branch.clone().unwrap_or_default();
+        let (port, pid) = by_key
+            .get(&name)
+            .or_else(|| by_key.get(&branch))
+            .cloned()
+            .unwrap_or_else(|| ("-".into(), 0));
+        let alive = pid > 0 && process::pid_alive(pid);
+        let listening = port != "-" && port.parse::<u16>().map(process::port_bound).unwrap_or(false);
+        let status = if alive || listening { "up" } else { "down" };
+        rows.push(WtRow {
+            name,
+            branch,
+            dir: wt.dir.clone(),
+            port,
+            status: status.to_string(),
+        });
     }
     rows.sort_by_key(|r| (status_rank(&r.status), port_num(&r.port)));
     rows
@@ -187,10 +227,12 @@ fn run_menu_inner(rows: &[Row], header: &str, multi: bool, stdout: &mut impl Wri
     }
 }
 
+/// One menu row per worktree. The DISPLAY shows the worktree name (identity) plus
+/// the branch when it differs — the value handed back is always the name.
 fn wt_menu_row(r: &WtRow) -> Row {
     Row {
-        display: format!("{:<32} {:<7} {}", r.branch, r.port, r.status),
-        value: r.branch.clone(),
+        display: format!("{:<32} {:<7} {}", r.label(), r.port, r.status),
+        value: r.name.clone(),
     }
 }
 
@@ -204,8 +246,8 @@ pub fn jump_pick(cfg: &Config) -> i32 {
     let mut rows: Vec<Row> = worktree_rows(cfg)
         .iter()
         .map(|r| Row {
-            display: format!("{:<32} {:<7} {}", r.branch, r.port, r.status),
-            value: cfg.dir_for(&r.branch).to_string_lossy().into_owned(),
+            display: format!("{:<32} {:<7} {}", r.label(), r.port, r.status),
+            value: r.dir.to_string_lossy().into_owned(),
         })
         .collect();
 
@@ -222,10 +264,13 @@ pub fn jump_pick(cfg: &Config) -> i32 {
     }
 
     if rows.is_empty() {
-        eprintln!("no worktrees under {} — nothing to jump to", cfg.wt_dir.display());
+        eprintln!(
+            "no worktrees under {} — nothing to jump to",
+            cfg.wt_dir.display()
+        );
         return 1;
     }
-    let picked = run_menu(rows, "BRANCH  PORT  STATUS", false);
+    let picked = run_menu(rows, "WORKTREE  PORT  STATUS", false);
     let Some(dir) = picked.into_iter().next() else {
         return 0; // cancelled
     };
@@ -248,7 +293,7 @@ pub fn jump_pick(cfg: &Config) -> i32 {
 /// start: pick a single stopped worktree and start it.
 pub fn start_pick(cfg: &Config) -> i32 {
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        eprintln!("usage: dcw start <branch>   (run it in a terminal to pick from a list)");
+        eprintln!("usage: dcw start <worktree>   (run it in a terminal to pick from a list)");
         return 2;
     }
     let rows: Vec<Row> = worktree_rows(cfg)
@@ -257,31 +302,37 @@ pub fn start_pick(cfg: &Config) -> i32 {
         .map(wt_menu_row)
         .collect();
     if rows.is_empty() {
-        eprintln!("no stopped worktrees under {} — create one with 'dcw new <branch>'", cfg.wt_dir.display());
+        eprintln!(
+            "no stopped worktrees under {} — create one with 'dcw new <branch>'",
+            cfg.wt_dir.display()
+        );
         return 1;
     }
-    let picked = run_menu(rows, "BRANCH  PORT  STATUS", false);
-    let Some(branch) = picked.into_iter().next() else {
+    let picked = run_menu(rows, "WORKTREE  PORT  STATUS", false);
+    let Some(name) = picked.into_iter().next() else {
         return 0;
     };
-    commands::start(cfg, Some(branch))
+    commands::start(cfg, Some(name))
 }
 
 /// stop: multi-select worktrees to stop.
 pub fn stop_pick(cfg: &Config) -> i32 {
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        eprintln!("usage: dcw stop <branch>   (run it in a terminal to pick from a list)");
+        eprintln!("usage: dcw stop <worktree>   (run it in a terminal to pick from a list)");
         return 2;
     }
     let rows = worktree_rows(cfg);
     if rows.is_empty() {
-        eprintln!("no worktrees under {} — nothing to stop", cfg.wt_dir.display());
+        eprintln!(
+            "no worktrees under {} — nothing to stop",
+            cfg.wt_dir.display()
+        );
         return 1;
     }
     let menu: Vec<Row> = rows.iter().map(wt_menu_row).collect();
-    let picked = run_menu(menu, "BRANCH  PORT  STATUS", true);
-    for branch in picked {
-        commands::stop(cfg, Some(branch));
+    let picked = run_menu(menu, "WORKTREE  PORT  STATUS", true);
+    for name in picked {
+        commands::stop(cfg, Some(name));
     }
     0
 }
@@ -289,16 +340,19 @@ pub fn stop_pick(cfg: &Config) -> i32 {
 /// abort: multi-select worktrees to destroy (with a combined confirmation).
 pub fn abort_pick(cfg: &Config) -> i32 {
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        eprintln!("usage: dcw abort <branch>   (run it in a terminal to pick from a list)");
+        eprintln!("usage: dcw abort <worktree>   (run it in a terminal to pick from a list)");
         return 2;
     }
     let rows = worktree_rows(cfg);
     if rows.is_empty() {
-        eprintln!("no worktrees under {} — nothing to abort", cfg.wt_dir.display());
+        eprintln!(
+            "no worktrees under {} — nothing to abort",
+            cfg.wt_dir.display()
+        );
         return 1;
     }
     let menu: Vec<Row> = rows.iter().map(wt_menu_row).collect();
-    let picked = run_menu(menu, "BRANCH  PORT  STATUS", true);
+    let picked = run_menu(menu, "WORKTREE  PORT  STATUS", true);
     if picked.is_empty() {
         return 0;
     }
@@ -306,9 +360,11 @@ pub fn abort_pick(cfg: &Config) -> i32 {
     // Combined summary + one confirmation (dcw's multi-target abort).
     let targets: Vec<(String, String)> = picked
         .iter()
-        .map(|b| {
-            let p = commands::port_of(cfg, b).map(|p| p.to_string()).unwrap_or_else(|| "-".into());
-            (b.clone(), p)
+        .map(|name| {
+            let p = commands::port_of(cfg, name)
+                .map(|p| p.to_string())
+                .unwrap_or_else(|| "-".into());
+            (name.clone(), p)
         })
         .collect();
     commands::print_destroy_summary(cfg, &targets);
@@ -317,15 +373,20 @@ pub fn abort_pick(cfg: &Config) -> i32 {
     print!("Proceed? [y/N] ");
     let _ = std::io::stdout().flush();
     let mut line = String::new();
-    if std::io::stdin().read_line(&mut line).is_err() || !matches!(line.trim().to_lowercase().as_str(), "y" | "yes") {
+    if std::io::stdin().read_line(&mut line).is_err()
+        || !matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+    {
         println!("aborted");
         return 1;
     }
     println!();
-    for branch in picked {
-        let wt = cfg.dir_for(&branch);
-        let port = commands::port_of(cfg, &branch);
-        commands::abort_one(cfg, &branch, &wt, port);
+    for name in picked {
+        let Some(t) = commands::find_target(cfg, &name) else {
+            eprintln!("dcw: {name} disappeared — skipped");
+            continue;
+        };
+        let port = commands::port_for(cfg, &t);
+        commands::abort_one(cfg, &t.name, &t.dir, port);
     }
     0
 }
@@ -333,7 +394,7 @@ pub fn abort_pick(cfg: &Config) -> i32 {
 /// logs: multi-select over running captains' logs; tail them together.
 pub fn logs_pick(cfg: &Config) -> i32 {
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        eprintln!("usage: dcw logs <branch> [celery]   (run it in a terminal to pick from a list)");
+        eprintln!("usage: dcw logs <worktree> [celery]   (run it in a terminal to pick from a list)");
         return 2;
     }
     let rows = log_rows(cfg);

@@ -22,20 +22,37 @@ enum Commands {
     /// Create a NEW worktree (clone DB, copy private files, set Redis namespace) and start it
     New { branch: Option<String> },
     /// Start server + worker for an EXISTING worktree (never creates one)
-    Start { branch: Option<String> },
-    /// Stop server + worker for a branch (keeps worktree/branch)
-    Stop { branch: Option<String> },
-    /// Stop then start a branch's server + worker (keeps worktree, DB, and port)
-    Restart { branch: Option<String> },
+    Start {
+        /// worktree name (its directory); a branch name resolves to its worktree
+        worktree: Option<String>,
+    },
+    /// Stop server + worker for a worktree (keeps worktree/branch)
+    Stop {
+        /// worktree name (its directory); a branch name resolves to its worktree
+        worktree: Option<String>,
+    },
+    /// Stop then start a worktree's server + worker (keeps worktree, DB, and port)
+    Restart {
+        /// worktree name (its directory); a branch name resolves to its worktree
+        worktree: Option<String>,
+    },
     /// List all git worktrees with their running/dead state, port, pid, and URL
     List,
     /// Pick a worktree with the arrow keys and print its path (shell function cds there)
     Jump,
     /// Destroy worktree + server + worker + DB (confirmation)
-    Abort { branch: Option<String> },
+    Abort {
+        /// worktree name (its directory); a branch name resolves to its worktree
+        worktree: Option<String>,
+    },
     /// Tail the server or worker log
-    Logs { branch: Option<String>, celery: Option<String> },
-    /// Manage a branch's Celery worker
+    Logs {
+        /// worktree name (its directory); a branch name resolves to its worktree
+        worktree: Option<String>,
+        /// "celery" to tail the worker log instead of the server log
+        celery: Option<String>,
+    },
+    /// Manage a worktree's Celery worker
     #[command(subcommand)]
     Celery(CeleryCmd),
     /// Download the latest prebuilt release and replace the running binary
@@ -71,10 +88,23 @@ struct InitArgs {
 
 #[derive(Subcommand)]
 enum CeleryCmd {
-    Start { branch: Option<String> },
-    Restart { branch: Option<String> },
-    Stop { branch: Option<String> },
+    Start { worktree: Option<String> },
+    Restart { worktree: Option<String> },
+    Stop { worktree: Option<String> },
     Status,
+}
+
+/// Resolve a user-supplied worktree name (or branch alias) to the key dcw files
+/// everything under: the worktree's directory name. Falls back to the raw argument
+/// (then the base branch) when it does not match a known worktree.
+fn resolve_key(cfg: &config::Config, arg: Option<String>) -> String {
+    match arg {
+        Some(a) => match commands::find_target(cfg, &a) {
+            Some(t) => t.name,
+            None => a,
+        },
+        None => cfg.base.clone(),
+    }
 }
 
 fn main() {
@@ -82,34 +112,34 @@ fn main() {
     let cfg = config::Config::load();
     let code = match cli.command {
         Commands::New { branch } => commands::create(&cfg, branch),
-        Commands::Start { branch } => commands::start(&cfg, branch),
-        Commands::Stop { branch } => commands::stop(&cfg, branch),
-        Commands::Restart { branch } => commands::restart(&cfg, branch),
+        Commands::Start { worktree } => commands::start(&cfg, worktree),
+        Commands::Stop { worktree } => commands::stop(&cfg, worktree),
+        Commands::Restart { worktree } => commands::restart(&cfg, worktree),
         Commands::List => {
             commands::list(&cfg);
             0
         }
         Commands::Jump => commands::jump(&cfg),
-        Commands::Abort { branch } => commands::abort(&cfg, branch),
-        Commands::Logs { branch, celery } => commands::logs(&cfg, branch, celery),
+        Commands::Abort { worktree } => commands::abort(&cfg, worktree),
+        Commands::Logs { worktree, celery } => commands::logs(&cfg, worktree, celery),
         Commands::Celery(c) => match c {
-            CeleryCmd::Start { branch } => {
-                let b = branch.unwrap_or_else(|| cfg.base.clone());
+            CeleryCmd::Start { worktree } => {
+                let b = resolve_key(&cfg, worktree);
                 match celery::celery_start(&cfg, &b, true) {
                     Ok(_) => 0,
                     Err(()) => 1,
                 }
             }
-            CeleryCmd::Restart { branch } => {
-                let b = branch.unwrap_or_else(|| cfg.base.clone());
+            CeleryCmd::Restart { worktree } => {
+                let b = resolve_key(&cfg, worktree);
                 celery::celery_stop(&cfg, &b);
                 match celery::celery_start(&cfg, &b, true) {
                     Ok(_) => 0,
                     Err(()) => 1,
                 }
             }
-            CeleryCmd::Stop { branch } => {
-                let b = branch.unwrap_or_else(|| cfg.base.clone());
+            CeleryCmd::Stop { worktree } => {
+                let b = resolve_key(&cfg, worktree);
                 celery::celery_stop(&cfg, &b);
                 0
             }
@@ -252,26 +282,27 @@ fn celery_status_all(cfg: &config::Config) {
         let Ok(text) = std::fs::read_to_string(cfg.celery_state_dir.join(&name)) else { continue };
         let mut lines = text.lines();
         let Some(pid) = lines.next().and_then(|l| l.trim().parse::<i32>().ok()) else { continue };
-        let branch = lines.next().unwrap_or(name.trim_end_matches(".pid")).to_string();
+        // line 2 is the worktree name the worker belongs to (dcw's identity)
+        let worktree = lines.next().unwrap_or(name.trim_end_matches(".pid")).to_string();
         let status = if !process::pid_alive(pid) {
             "dead"
         } else {
-            let log = celery::logfile(cfg, &branch);
+            let log = celery::logfile(cfg, &worktree);
             if std::fs::read_to_string(&log).map(|s| s.contains(" ready.")).unwrap_or(false) {
                 "ready"
             } else {
                 "starting"
             }
         };
-        let ns = db::env_value(&cfg.dir_for(&branch).join("hmx/.env"), "HMX_INSTANCE_NAMESPACE");
-        rows.push((branch.clone(), pid, status.to_string(), ns, celery::logfile(cfg, &branch)));
+        let ns = db::env_value(&cfg.dir_for(&worktree).join("hmx/.env"), "HMX_INSTANCE_NAMESPACE");
+        rows.push((worktree.clone(), pid, status.to_string(), ns, celery::logfile(cfg, &worktree)));
     }
     if rows.is_empty() {
         println!("(no celery workers)");
         return;
     }
-    println!("{:<28} {:<10} {:<10} {:<44} LOG", "BRANCH", "PID", "STATUS", "NS");
-    for (branch, pid, status, ns, log) in rows {
-        println!("{branch:<28} {pid:<10} {status:<10} {ns:<44} {}", log.display());
+    println!("{:<28} {:<10} {:<10} {:<44} LOG", "WORKTREE", "PID", "STATUS", "NS");
+    for (worktree, pid, status, ns, log) in rows {
+        println!("{worktree:<28} {pid:<10} {status:<10} {ns:<44} {}", log.display());
     }
 }

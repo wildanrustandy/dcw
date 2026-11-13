@@ -27,13 +27,13 @@ dcw init --yes --repo ~/work/hmx --venv ~/work/venv --port-base 5300 --port-max 
 
 ```
 dcw new <branch>        buat worktree (clone DB + file privat + namespace Redis) lalu jalankan
-dcw start [branch]      jalankan server+worker untuk worktree yang SUDAH ADA
-dcw stop [branch]       stop server+worker (worktree & DB tetap)
-dcw restart [branch]    stop lalu start server+worker (worktree & DB tetap)
+dcw start [worktree]    jalankan server+worker untuk worktree yang SUDAH ADA
+dcw stop [worktree]     stop server+worker (worktree & DB tetap)
+dcw restart [worktree]  stop lalu start server+worker (worktree & DB tetap)
 dcw jump                pilih worktree → cd ke folder hmx-nya
 dcw list                daftar worktree + status (up/dead) + URL
-dcw abort [branch]      hapus worktree + stop + DROP DB (konfirmasi)
-dcw logs [branch]       tail log server atau worker
+dcw abort [worktree]    hapus worktree + stop + DROP DB (konfirmasi)
+dcw logs [worktree]     tail log server atau worker
 dcw celery <cmd>        kelola worker (start|restart|stop|status)
 dcw update              unduh binary rilis terbaru, ganti binary terpasang
 dcw init                lihat config / set up ulang
@@ -42,7 +42,12 @@ dcw uninstall           hapus dcw dari mesin
 
 **`new` vs `start`**: `new` hanya untuk worktree yang belum ada; `start` hanya yang sudah
 ada. Tanpa argumen, `start`/`stop`/`abort`/`logs`/`jump` membuka **menu panah** (butuh TTY;
-di script/cron, sebut branch secara eksplisit).
+di script/cron, sebut worktree secara eksplisit).
+
+**Identitas = nama worktree, bukan nama branch.** `dcw start`/`stop`/`restart`/`abort`/
+`logs` menerima nama direktori worktree (mis. `PRD_INV_00296`), karena satu worktree bisa
+di-`git switch` ke branch lain kapan saja. Nama branch tetap diterima sebagai alias dan
+diresolusi ke worktree yang memilikinya, tetapi output selalu menyebut nama worktree.
 
 `dcw jump` butuh fungsi shell `dcw()` yang ditulis oleh `dcw init --bin` (buka terminal
 baru setelahnya). Helpers venv `venvmain`/`venvhere` juga dipasang oleh `dcw init`.
