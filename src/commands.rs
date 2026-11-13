@@ -459,7 +459,11 @@ pub fn list(cfg: &Config) {
         return;
     }
     let reg = registry::load(&cfg.reg_file);
-    // branch -> (port, pid, status, celery)
+    // branch -> (port, pid, status, celery). The registry is keyed by branch,
+    // but a worktree's checked-out branch can CHANGE after creation (git switch
+    // inside the worktree) while its directory name stays stable — and the
+    // directory name is what dcw uses as the worktree's identity elsewhere
+    // (dir_for, logs). So look entries up by branch first, then by name.
     let runtime: std::collections::HashMap<String, (String, i32, String, String)> = reg
         .iter()
         .filter_map(|(port, info)| {
@@ -487,8 +491,12 @@ pub fn list(cfg: &Config) {
         // the WORKTREE's own name (its directory), not the branch ref.
         let branch = wt.branch.clone().unwrap_or_default();
         let name = worktree_name(cfg, wt);
+        // Match the registry entry by checked-out branch OR by worktree name:
+        // a `git switch` inside the worktree changes the branch but not the
+        // name dcw created it under (dir_for/registry key).
         let (port, pid, status, cel) = runtime
             .get(&branch)
+            .or_else(|| runtime.get(&name))
             .cloned()
             .unwrap_or_else(|| ("-".into(), 0, "dead".into(), "-".into()));
         let port_n = port.parse::<u16>().ok();
