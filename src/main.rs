@@ -25,6 +25,8 @@ enum Commands {
     Start { branch: Option<String> },
     /// Stop server + worker for a branch (keeps worktree/branch)
     Stop { branch: Option<String> },
+    /// Stop then start a branch's server + worker (keeps worktree, DB, and port)
+    Restart { branch: Option<String> },
     /// List all git worktrees with their running/dead state, port, pid, and URL
     List,
     /// Pick a worktree with the arrow keys and print its path (shell function cds there)
@@ -82,6 +84,7 @@ fn main() {
         Commands::New { branch } => commands::create(&cfg, branch),
         Commands::Start { branch } => commands::start(&cfg, branch),
         Commands::Stop { branch } => commands::stop(&cfg, branch),
+        Commands::Restart { branch } => commands::restart(&cfg, branch),
         Commands::List => {
             commands::list(&cfg);
             0

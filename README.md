@@ -29,6 +29,7 @@ dcw init --yes --repo ~/work/hmx --venv ~/work/venv --port-base 5300 --port-max 
 dcw new <branch>        buat worktree (clone DB + file privat + namespace Redis) lalu jalankan
 dcw start [branch]      jalankan server+worker untuk worktree yang SUDAH ADA
 dcw stop [branch]       stop server+worker (worktree & DB tetap)
+dcw restart [branch]    stop lalu start server+worker (worktree & DB tetap)
 dcw jump                pilih worktree → cd ke folder hmx-nya
 dcw list                daftar worktree + status (up/dead) + URL
 dcw abort [branch]      hapus worktree + stop + DROP DB (konfirmasi)

@@ -386,6 +386,23 @@ pub fn stop(cfg: &Config, branch: Option<String>) -> i32 {
     0
 }
 
+/// ── restart ──────────────────────────────────────────────────────
+/// Stop then start a branch's server + worker. The port stays sticky (stop
+/// clears the registry pid but keeps the entry), and the worktree/DB are
+/// untouched. Restarting a branch that isn't running just starts it.
+pub fn restart(cfg: &Config, branch: Option<String>) -> i32 {
+    ensure_dirs(cfg);
+    let branch = match branch {
+        Some(b) => b,
+        None => return crate::picker::stop_pick(cfg),
+    };
+    let code = stop(cfg, Some(branch.clone()));
+    if code != 0 {
+        return code;
+    }
+    start(cfg, Some(branch))
+}
+
 /// ── abort ────────────────────────────────────────────────────────
 pub fn abort(cfg: &Config, branch: Option<String>) -> i32 {
     ensure_dirs(cfg);
