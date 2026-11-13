@@ -634,7 +634,10 @@ pub fn list(cfg: &Config) {
 /// `feat/x` for a slashed branch), `(repo)` for the main checkout, or the full
 /// directory path when the worktree lives outside $WT_DIR.
 pub fn worktree_name(cfg: &Config, wt: &git::Worktree) -> String {
-    if wt.dir == cfg.repo {
+    // `git worktree list` prints realpaths, so a repo reached through a symlink (macOS
+    // /tmp -> /private/tmp, /var -> /private/var, or a symlinked home) would never
+    // match the configured prefix. Compare canonicalized paths as a second chance.
+    if wt.dir == cfg.repo || same_dir(&wt.dir, &cfg.repo) {
         return "(repo)".to_string();
     }
     if let Ok(rel) = wt.dir.strip_prefix(&cfg.wt_dir) {
@@ -642,7 +645,29 @@ pub fn worktree_name(cfg: &Config, wt: &git::Worktree) -> String {
             return rel.to_string_lossy().into_owned();
         }
     }
+    if let Ok(rel) = relative_through_symlinks(&wt.dir, &cfg.wt_dir) {
+        if !rel.as_os_str().is_empty() {
+            return rel.to_string_lossy().into_owned();
+        }
+    }
     wt.dir.to_string_lossy().into_owned()
+}
+
+/// True when both paths point at the same directory once symlinks are resolved.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    match (a.canonicalize(), b.canonicalize()) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// `wt_dir`-relative path, resolving symlinks on both sides (macOS /tmp is a symlink).
+fn relative_through_symlinks(dir: &Path, base: &Path) -> std::io::Result<PathBuf> {
+    let dir = dir.canonicalize()?;
+    let base = base.canonicalize()?;
+    dir.strip_prefix(&base)
+        .map(|p| p.to_path_buf())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::NotFound))
 }
 
 /// Render a Unicode box-drawing table (ASCII fallback, like dcw's `box()`).
