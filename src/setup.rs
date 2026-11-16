@@ -251,21 +251,46 @@ fn install_shell_integration(bin_dir: &std::path::Path) {
     let marker = "# dcw shell integration (added by dcw init)";
     let body = format!(
         r#"{marker}
-# A function, not the binary: `dcw jump` opens the picker and cds into the chosen
-# worktree, which a child process cannot do to its parent shell. Every other
+# A function, not the binary: `dcw jump` (and `dcw new`) cds the CALLING shell into
+# the worktree, which a child process cannot do to its parent shell. `dcw new` writes
+# the worktree path to $DCW_CD_FILE; `dcw jump` prints it on stdout. Every other
 # subcommand is passed straight through. `command dcw ...` bypasses this.
 dcw() {{
   local _dcw_bin="${{DCW_BIN:-{bin}}}"
-  if [ "${{1:-}}" = jump ]; then
-    local _dcw_dir
-    _dcw_dir=$("$_dcw_bin" jump) || return $?
+  # Shared cd helper: cds into <dir>/hmx when the Django project lives there, else
+  # into <dir> itself. Empty/unreadable target is a silent no-op.
+  _dcw_cd() {{
+    local _dcw_dir="$1"
     [ -n "$_dcw_dir" ] || return 0
     if [ -d "$_dcw_dir/hmx" ]; then
       cd "$_dcw_dir/hmx"
     elif [ -d "$_dcw_dir" ]; then
       cd "$_dcw_dir"
     fi
+  }}
+  if [ "${{1:-}}" = jump ]; then
+    local _dcw_dir
+    _dcw_dir=$("$_dcw_bin" jump) || return $?
+    _dcw_cd "$_dcw_dir"
     return 0
+  fi
+  if [ "${{1:-}}" = new ]; then
+    # `new` creates the worktree and then hands its path back through DCW_CD_FILE
+    # (the branch is chosen before the worktree exists, so a plain stdout handoff
+    # would be ambiguous with the picker case).
+    local _dcw_tmp _dcw_rc
+    _dcw_tmp="$(mktemp)" || _dcw_tmp=""
+    if [ -n "$_dcw_tmp" ]; then
+      DCW_CD_FILE="$_dcw_tmp" "$_dcw_bin" "$@"
+    else
+      "$_dcw_bin" "$@"
+    fi
+    _dcw_rc=$?
+    if [ -n "$_dcw_tmp" ]; then
+      _dcw_cd "$(cat "$_dcw_tmp" 2>/dev/null)"
+      rm -f "$_dcw_tmp"
+    fi
+    return $_dcw_rc
   fi
   "$_dcw_bin" "$@"
 }}

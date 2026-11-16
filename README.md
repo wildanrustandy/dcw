@@ -26,7 +26,7 @@ dcw init --yes --repo ~/work/hmx --venv ~/work/venv --port-base 5300 --port-max 
 ## Usage
 
 ```
-dcw new <branch>        buat worktree (clone DB + file privat + namespace Redis) lalu jalankan
+dcw new <branch>        buat worktree (clone DB + file privat + namespace Redis), jalankan, lalu cd ke folder hmx-nya
 dcw start [worktree]    jalankan server+worker untuk worktree yang SUDAH ADA
 dcw stop [worktree]     stop server+worker (worktree & DB tetap)
 dcw restart [worktree]  stop lalu start server+worker (worktree & DB tetap)
@@ -49,8 +49,11 @@ di script/cron, sebut worktree secara eksplisit).
 di-`git switch` ke branch lain kapan saja. Nama branch tetap diterima sebagai alias dan
 diresolusi ke worktree yang memilikinya, tetapi output selalu menyebut nama worktree.
 
-`dcw jump` butuh fungsi shell `dcw()` yang ditulis oleh `dcw init --bin` (buka terminal
-baru setelahnya). Helpers venv `venvmain`/`venvhere` juga dipasang oleh `dcw init`.
+`dcw jump` dan `dcw new` butuh fungsi shell `dcw()` yang ditulis oleh `dcw init --bin`
+(buka terminal baru setelahnya) — keduanya melakukan `cd` ke shell pemanggil: `jump`
+(setelah memilih worktree) dan `new` (setelah selesai membuat worktree; path diteruskan
+lewat `$DCW_CD_FILE`). `dcw new` yang gagal tidak melakukan `cd`. Helpers venv
+`venvmain`/`venvhere` juga dipasang oleh `dcw init`.
 
 ## Config
 

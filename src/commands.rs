@@ -344,8 +344,28 @@ pub fn create(cfg: &Config, branch: Option<String>) -> i32 {
         dir: wt,
         branch: Some(branch.clone()),
     };
-    bring_up(cfg, &target, port, false)
+    let code = bring_up(cfg, &target, port, false);
+    if code == 0 {
+        // Let the installed `dcw` shell function cd the CALLING shell into the new
+        // worktree. A child process cannot cd its parent, so the path goes through
+        // DCW_CD_FILE for the wrapper to read (the wrapper cds into <dir>/hmx when
+        // it exists, else the worktree root).
+        write_cd_file(&target.dir);
+    }
+    code
 }
+
+/// Hand the caller's shell function a directory to cd into (read by the installed
+/// `dcw()` wrapper via $DCW_CD_FILE). No-op when the variable is empty or writing
+/// fails — a missing cd target must never fail the command.
+fn write_cd_file(dir: &Path) {
+    if let Ok(path) = std::env::var("DCW_CD_FILE") {
+        if !path.is_empty() {
+            let _ = std::fs::write(path, dir.to_string_lossy().as_bytes());
+        }
+    }
+}
+
 
 /// ── start ────────────────────────────────────────────────────────
 /// Start server + worker for an EXISTING worktree (or the base branch, which runs
