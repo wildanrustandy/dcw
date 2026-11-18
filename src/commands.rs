@@ -28,35 +28,86 @@ pub struct Target {
     pub branch: Option<String>,
 }
 
-/// Resolve `arg` (a worktree name, or a branch checked out inside one) to a Target.
-/// The base branch resolves to the main checkout itself.
+/// Canonical target for the main checkout ($REPO). The base branch's server always
+/// lives in $REPO itself on port_base; its stable identity is cfg.base.
+fn base_target(cfg: &Config) -> Target {
+    Target {
+        name: cfg.base.clone(),
+        dir: cfg.repo.clone(),
+        branch: git::current_branch(&cfg.repo),
+    }
+}
+
+/// True when `arg` names $REPO itself by path (`.`, or a path that resolves to the
+/// repo root). Lets `dcw start .` / `dcw start /path/to/repo` address the main
+/// checkout (repo utama, bukan worktree) without knowing the base branch name.
+fn is_repo_path(cfg: &Config, arg: &str) -> bool {
+    if arg == "." {
+        if let Ok(cwd) = std::env::current_dir() {
+            return cwd == cfg.repo || same_dir(&cwd, &cfg.repo);
+        }
+        return false;
+    }
+    let p = Path::new(arg);
+    let path_shaped = p.is_absolute() || arg.contains('/') || arg == "..";
+    if path_shaped {
+        return p == cfg.repo || same_dir(p, &cfg.repo);
+    }
+    false
+}
+
+/// True when `arg` is a filesystem path rather than a worktree/branch name. Such an
+/// argument must NOT fall through to the `dir_for()` guess: `dir_for(".")` answers
+/// `$WT_DIR/.` and `dir_for("")` answers `$WT_DIR` itself, both of which exist
+/// whenever `.worktrees/` does — so `dcw start .` or `dcw start ""` run from OUTSIDE
+/// the repo would otherwise invent a bogus target and reserve a port.
+fn is_path_arg(arg: &str) -> bool {
+    Path::new(arg).is_absolute() || arg == "." || arg == ".." || arg.is_empty()
+}
+
+/// Locate a target by its worktree directory name, by the branch checked out in it,
+/// or (for the main checkout, which is not a worktree under .worktrees/) by the base
+/// branch name, the "(repo)" label shown by `dcw list`, or a path resolving to $REPO.
+///
+/// The returned name is dcw's stable identity: it keeps the port, the log file, and
+/// the celery pidfile when the user `git switch`es the worktree to a different branch.
+/// The main checkout canonicalizes to cfg.base so its port/log/registry stay
+/// consistent regardless of how it was named.
 pub fn find_target(cfg: &Config, arg: &str) -> Option<Target> {
-    if arg == cfg.base {
-        return Some(Target {
-            name: cfg.base.clone(),
-            dir: cfg.repo.clone(),
-            branch: git::current_branch(&cfg.repo),
-        });
+    if arg == cfg.base || arg == "(repo)" || is_repo_path(cfg, arg) {
+        return Some(base_target(cfg));
     }
     for wt in git::list_worktrees(&cfg.repo) {
         let name = worktree_name(cfg, &wt);
         if name != arg && wt.branch.as_deref() != Some(arg) {
             continue;
         }
-        let branch = wt.branch.clone();
-        let dir = wt.dir.clone();
-        return Some(Target { name, dir, branch });
+        // The main checkout may appear in git's worktree list: canonicalize it.
+        if wt.dir == cfg.repo || same_dir(&wt.dir, &cfg.repo) {
+            return Some(base_target(cfg));
+        }
+        return Some(Target {
+            name,
+            dir: wt.dir.clone(),
+            branch: wt.branch.clone(),
+        });
     }
     // A worktree git does not list (detached, or not yet registered): fall back to
-    // the path dcw would have created for it.
-    let dir = cfg.dir_for(arg);
-    if dir.is_dir() {
-        let branch = git::current_branch(&dir);
-        return Some(Target {
-            name: arg.to_string(),
-            dir,
-            branch,
-        });
+    // the path dcw would have created for it. Never guess from a path-shaped arg —
+    // `dir_for(".")` exists whenever .worktrees/ does, and would invent a bogus target.
+    if !is_path_arg(arg) {
+        let dir = cfg.dir_for(arg);
+        if dir.is_dir() {
+            if dir == cfg.repo || same_dir(&dir, &cfg.repo) {
+                return Some(base_target(cfg));
+            }
+            let branch = git::current_branch(&dir);
+            return Some(Target {
+                name: arg.to_string(),
+                dir,
+                branch,
+            });
+        }
     }
     None
 }
@@ -64,6 +115,11 @@ pub fn find_target(cfg: &Config, arg: &str) -> Option<Target> {
 /// Port recorded for a target: by its worktree name first (the key dcw allocated the
 /// port under), then by its currently checked-out branch (older registry entries).
 pub fn port_for(cfg: &Config, t: &Target) -> Option<u16> {
+    // The base checkout always lives on PORT_BASE even when nothing is registered
+    // yet, so `dcw stop <base>` works on a never-started / fully-stopped captain.
+    if t.dir == cfg.repo {
+        return Some(cfg.port_base);
+    }
     port_of(cfg, &t.name).or_else(|| t.branch.as_deref().and_then(|b| port_of(cfg, b)))
 }
 
@@ -387,8 +443,8 @@ pub fn start(cfg: &Config, name: Option<String>) -> i32 {
     }
 
     let Some(target) = find_target(cfg, &name) else {
-        eprintln!("error: no worktree named '{name}' — create it first: dcw new {name}");
-        eprintln!("       'dcw list' shows every existing worktree");
+        eprintln!("error: no target named '{name}' — not a worktree, the base branch, or the repo itself");
+        eprintln!("       'dcw list' shows every existing worktree (the main checkout is '(repo)')");
         return 2;
     };
 
@@ -456,7 +512,7 @@ pub fn stop(cfg: &Config, name: Option<String>) -> i32 {
         None => return crate::picker::stop_pick(cfg),
     };
     let Some(target) = find_target(cfg, &name) else {
-        eprintln!("error: no worktree named '{name}' (see 'dcw list')");
+        eprintln!("error: no target named '{name}' (see 'dcw list')");
         return 2;
     };
     let port = match port_for(cfg, &target) {
@@ -499,7 +555,7 @@ pub fn abort(cfg: &Config, name: Option<String>) -> i32 {
         None => return crate::picker::abort_pick(cfg),
     };
     let Some(target) = find_target(cfg, &name) else {
-        eprintln!("error: no worktree named '{name}' (see 'dcw list')");
+        eprintln!("error: no target named '{name}' (see 'dcw list')");
         return 2;
     };
     if target.dir == cfg.repo {
