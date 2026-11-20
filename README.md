@@ -83,9 +83,11 @@ Precedence: **env per-call** > `~/.config/dcw/config` > default.
 cargo build --release   # -> target/release/dcw
 ```
 
-Rilis Linux di-build otomatis oleh GitHub Actions (`.github/workflows/release.yml`)
-saat push tag `v*`. Binary macOS di-cross-compile via `cargo-zigbuild` (atau build di
-Mac), lalu `gh release upload <tag> dcw-macos-<arch>`.
+Rilis Linux x86_64 dan macOS (arm64 + Intel) di-build otomatis oleh GitHub Actions
+(`.github/workflows/release.yml`) saat push tag `v*`. `dcw update` mengunduh
+`dcw-<os>-<arch>` dari release **latest** — jadi setiap rilis baru harus menyertakan
+ketiga asset itu, kalau tidak `dcw update` di platform yang asset-nya hilang akan
+404. Upload manual bila perlu: `gh release upload <tag> dcw-macos-<arch>`.
 
 ## Uninstall
 

@@ -1,11 +1,12 @@
 name: release
 
-# Build the Linux prebuilt binary and publish it as a GitHub release asset.
+# Build the prebuilt binaries (Linux x86_64, macOS arm64, macOS Intel) and publish
+# them as GitHub release assets. Asset names must match the `dcw-<os>-<arch>` form
+# `dcw update` derives from std::env::consts (src/main.rs update_url).
 #
-# macOS runners are NOT available on free GitHub accounts, so macOS binaries are
-# built on a Mac and uploaded manually (see README "Rilis (prebuilt binary)"):
-#   cargo build --release && cp target/release/dcw dcw-macos-aarch64
-#   gh release upload <tag> dcw-macos-aarch64
+# macOS is built on GitHub's macOS runner: this repo is public, where those runners
+# are free. Both macOS targets build on the arm64 runner (Apple's clang cross-builds
+# to Intel), so no retired x86_64 runner is needed.
 
 on:
   push:
@@ -17,7 +18,7 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  linux:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -30,3 +31,23 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: dcw-linux-x86_64
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build (release, arm64 + Intel)
+        run: |
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+          cp target/aarch64-apple-darwin/release/dcw dcw-macos-aarch64
+          cp target/x86_64-apple-darwin/release/dcw dcw-macos-x86_64
+      - name: Publish release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dcw-macos-aarch64
+            dcw-macos-x86_64

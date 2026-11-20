@@ -203,6 +203,14 @@ fn update(_cfg: &config::Config) -> i32 {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755));
     }
+    // macOS: Gatekeeper quarantines a binary fetched by curl and kills the unsigned
+    // result on first run. install.sh strips the attribute; do the same here, else the
+    // freshly swapped dcw would be unrunnable.
+    #[cfg(target_os = "macos")]
+    let _ = std::process::Command::new("xattr")
+        .args(["-d", "com.apple.quarantine"])
+        .arg(&tmp)
+        .status();
     let new_version = std::process::Command::new(&tmp)
         .arg("--version")
         .output()
