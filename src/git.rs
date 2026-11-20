@@ -49,8 +49,13 @@ pub fn ref_exists(repo: &Path, full_ref: &str) -> bool {
     git_status(repo, &["show-ref", "--verify", "--quiet", full_ref])
 }
 
-pub fn fetch_origin(repo: &Path) -> (bool, String) {
-    let (ok, out, err) = git_output(repo, &["fetch", "origin"]);
+/// Fetch ONE ref (the base branch) from origin. A plain `git fetch origin` also walks
+/// every other branch's refs and objects, which on a repo with hundreds of branches is
+/// most of the fetch time; `dcw new` only needs the base. Passing the branch name still
+/// updates origin/<branch> opportunistically (git's default refspec applies), which is
+/// the ref the start-point resolution reads.
+pub fn fetch_origin(repo: &Path, base: &str) -> (bool, String) {
+    let (ok, out, err) = git_output(repo, &["fetch", "origin", base]);
     let msg = if err.trim().is_empty() { out } else { err };
     (ok, msg)
 }

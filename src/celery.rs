@@ -139,13 +139,18 @@ pub fn celery_start(cfg: &Config, branch: &str, wait: bool) -> Result<i32, ()> {
 }
 
 /// Stop the branch's worker (keeps branch/worktree). dcw stop sequence.
-pub fn celery_stop(cfg: &Config, branch: &str) {
+///
+/// `grace_secs` is the SIGTERM window before the group is SIGKILLed. A celery warm
+/// shutdown drains a broker whose queues exist for this worktree alone and takes ~5-7s
+/// — and every caller either relaunches (`restart`) or discards (`abort`) that
+/// worktree right after, so a short window is enough; `abort` passes 0.
+pub fn celery_stop(cfg: &Config, branch: &str, grace_secs: u64) {
     let Some(pid) = celery_pid(cfg, branch) else {
         let _ = std::fs::remove_file(pidfile(cfg, branch));
         println!("  celery:  not running");
         return;
     };
-    process::terminate_and_wait(pid, 15);
+    process::stop_group(pid, grace_secs);
     let _ = std::fs::remove_file(pidfile(cfg, branch));
     println!("  celery:  stopped (pid {pid})");
 }
