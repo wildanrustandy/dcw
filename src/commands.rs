@@ -342,7 +342,9 @@ pub fn create(cfg: &Config, branch: Option<String>) -> i32 {
     }
 
     // fetch so a new branch starts at the latest remote commit
+    let spin = crate::progress::Spinner::start(&format!("fetch origin/{}", cfg.base));
     let (ok, msg) = git::fetch_origin(&cfg.repo, &cfg.base);
+    spin.stop();
     if !ok {
         eprintln!("dcw: warning: git fetch origin failed; using existing local refs");
     } else if !msg.trim().is_empty() {
@@ -353,34 +355,37 @@ pub fn create(cfg: &Config, branch: Option<String>) -> i32 {
 
     // The DB clone only reads $REPO and the branch name, so it runs alongside the
     // checkout (which is the other slow half of `dcw new`) instead of after it.
-    // `None` means the start point is missing; `Some(false)`, the checkout failed.
-    let ((db_lines, db_created), added) = std::thread::scope(|s| {
+    // `None` means the start point is missing; the `bool`, the checkout result.
+    let spin = crate::progress::Spinner::start("creating worktree + cloning DB");
+    let db_lines = std::thread::scope(|s| {
         let db = s.spawn(|| db::db_clone(cfg, &branch));
         // start-point order: existing local branch → origin/<base> → local <base>
-        let result = if git::ref_exists(&cfg.repo, &format!("refs/heads/{branch}")) {
+        let added = if git::ref_exists(&cfg.repo, &format!("refs/heads/{branch}")) {
             git::worktree_add_existing(&cfg.repo, &wt, &branch)
         } else if git::ref_exists(&cfg.repo, &format!("refs/remotes/origin/{}", cfg.base)) {
             git::worktree_add_new(&cfg.repo, &wt, &branch, &format!("origin/{}", cfg.base))
         } else if git::ref_exists(&cfg.repo, &format!("refs/heads/{}", cfg.base)) {
             git::worktree_add_new(&cfg.repo, &wt, &branch, &cfg.base)
         } else {
-            eprintln!("dcw: error: neither origin/{} nor local {} exists in {}.", cfg.base, cfg.base, cfg.repo.display());
-            eprintln!("       fetch the base branch, or set DEV_CAPTAIN_BASE=<branch>.");
-            return ((Vec::new(), false), None);
+            // Printed after the spinner stops, so the two do not share a line.
+            return None;
         };
-        let db = db.join().unwrap_or_default();
-        (db, Some(result))
+        let (db, created) = db.join().unwrap_or_default();
+        Some((db, created, added))
     });
-    if !matches!(added, Some(true)) {
+    spin.stop();
+    let Some((db_lines, db_created, added)) = db_lines else {
+        eprintln!("dcw: error: neither origin/{} nor local {} exists in {}.", cfg.base, cfg.base, cfg.repo.display());
+        eprintln!("       fetch the base branch, or set DEV_CAPTAIN_BASE=<branch>.");
+        return 2;
+    };
+    if !added {
         // Don't leave a cloned DB behind for a worktree that was never created.
         if db_created {
             db::db_drop(cfg, &branch);
         }
-        if added.is_some() {
-            eprintln!("dcw: error: could not add worktree for {branch}");
-            return 1;
-        }
-        return 2;
+        eprintln!("dcw: error: could not add worktree for {branch}");
+        return 1;
     }
     for line in db_lines {
         println!("{line}");
