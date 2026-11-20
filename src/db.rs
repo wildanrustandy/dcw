@@ -95,20 +95,25 @@ fn db_exists(conn: &Conn, name: &str) -> bool {
 }
 
 /// Clone the main DB into the branch's DB. Never fatal to the caller's flow if tools
-/// are missing (dcw skips DB clone when psql is absent). Returns a message.
-pub fn db_clone(cfg: &Config, branch: &str) {
+/// are missing (dcw skips DB clone when psql is absent).
+///
+/// Returns its log lines instead of printing them so `dcw new` can run the clone on a
+/// thread alongside the worktree checkout and print both cleanly when they are done.
+/// The bool says whether this call created the DB, so a failed checkout can drop it.
+pub fn db_clone(cfg: &Config, branch: &str) -> (Vec<String>, bool) {
+    let mut out = Vec::new();
     let dst = cfg.db_name(branch);
     let Some(conn) = (crate::process::which("psql").is_some()).then(|| conn_vars(cfg)) else {
-        eprintln!("  db:      psql not found; DB clone skipped");
-        return;
+        out.push("  db:      psql not found; DB clone skipped".into());
+        return (out, false);
     };
 
     if db_exists(&conn, &dst) {
-        println!("  db:      {dst} already exists");
-        return;
+        out.push(format!("  db:      {dst} already exists"));
+        return (out, false);
     }
     let src = default_db_name(cfg);
-    println!("  db:      cloning {src} -> {dst}");
+    out.push(format!("  db:      cloning {src} -> {dst}"));
 
     // fast path: template clone
     let createdb = Command::new("createdb")
@@ -120,10 +125,10 @@ pub fn db_clone(cfg: &Config, branch: &str) {
         .map(|s| s.success())
         .unwrap_or(false);
     if createdb {
-        return;
+        return (out, true);
     }
 
-    println!("  db:      template clone failed (source DB in use?); retrying with dump/restore");
+    out.push("  db:      template clone failed (source DB in use?); retrying with dump/restore".into());
 
     // fallback: plain create + dump/restore
     let plain = Command::new("createdb")
@@ -135,8 +140,8 @@ pub fn db_clone(cfg: &Config, branch: &str) {
         .map(|s| s.success())
         .unwrap_or(false);
     if !plain {
-        eprintln!("  db:      create failed; giving up on {dst}");
-        return;
+        out.push(format!("  db:      create failed; giving up on {dst}"));
+        return (out, false);
     }
 
     // pg_dump | psql
@@ -147,8 +152,8 @@ pub fn db_clone(cfg: &Config, branch: &str) {
         .stderr(std::process::Stdio::null())
         .spawn();
     let Ok(dump) = dump else {
-        eprintln!("  db:      pg_dump failed; {dst} left empty");
-        return;
+        out.push(format!("  db:      pg_dump failed; {dst} left empty"));
+        return (out, true);
     };
     let restore = Command::new("psql")
         .env("PGPASSWORD", &conn.password)
@@ -158,8 +163,9 @@ pub fn db_clone(cfg: &Config, branch: &str) {
         .stderr(std::process::Stdio::null())
         .status();
     if !restore.map(|s| s.success()).unwrap_or(false) {
-        eprintln!("  db:      restore failed; {dst} may be empty");
+        out.push(format!("  db:      restore failed; {dst} may be empty"));
     }
+    (out, true)
 }
 
 /// Drop the branch's DB. Non-fatal (dcw warns and keeps the DB on failure).

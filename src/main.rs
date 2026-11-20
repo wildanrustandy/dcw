@@ -132,7 +132,7 @@ fn main() {
             }
             CeleryCmd::Restart { worktree } => {
                 let b = resolve_key(&cfg, worktree);
-                celery::celery_stop(&cfg, &b);
+                celery::celery_stop(&cfg, &b, 2);
                 match celery::celery_start(&cfg, &b, true) {
                     Ok(_) => 0,
                     Err(()) => 1,
@@ -140,7 +140,7 @@ fn main() {
             }
             CeleryCmd::Stop { worktree } => {
                 let b = resolve_key(&cfg, worktree);
-                celery::celery_stop(&cfg, &b);
+                celery::celery_stop(&cfg, &b, 2);
                 0
             }
             CeleryCmd::Status => {

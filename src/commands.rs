@@ -201,23 +201,19 @@ fn port_alloc(cfg: &Config, branch: &str) -> Result<u16, String> {
 }
 
 /// Kill everything bound to a port and clear its registry pid (base branch keeps a
-/// pid=0 tombstone so its port stays reserved).
-fn kill_port(cfg: &Config, port: u16) {
-    // Kill the recorded parent pid first (a reloader parent may respawn a killed
-    // child).
+/// pid=0 tombstone so its port stays reserved). `grace_secs` is the graceful window
+/// for the recorded server: `dcw stop` allows 2s, `abort` (tree about to be deleted)
+/// passes 0.
+fn kill_port(cfg: &Config, port: u16, grace_secs: u64) {
+    // The recorded pid is the group leader (spawn_detached setsid's it), so this
+    // reaches the server's children too.
     let rec = registry::load(&cfg.reg_file)
         .get(&port.to_string())
         .and_then(|i| (i.pid > 0).then_some(i.pid));
     if let Some(pid) = rec {
-        process::signal(pid, nix::sys::signal::Signal::SIGTERM);
+        process::stop_group(pid, grace_secs);
     }
-    for pid in lsof_listeners(port) {
-        process::signal(pid, nix::sys::signal::Signal::SIGTERM);
-    }
-    std::thread::sleep(std::time::Duration::from_secs(1));
-    if let Some(pid) = rec {
-        process::signal(pid, nix::sys::signal::Signal::SIGKILL);
-    }
+    // Anything still listening that dcw did not spawn itself.
     for pid in lsof_listeners(port) {
         process::signal(pid, nix::sys::signal::Signal::SIGKILL);
     }
@@ -346,7 +342,7 @@ pub fn create(cfg: &Config, branch: Option<String>) -> i32 {
     }
 
     // fetch so a new branch starts at the latest remote commit
-    let (ok, msg) = git::fetch_origin(&cfg.repo);
+    let (ok, msg) = git::fetch_origin(&cfg.repo, &cfg.base);
     if !ok {
         eprintln!("dcw: warning: git fetch origin failed; using existing local refs");
     } else if !msg.trim().is_empty() {
@@ -355,21 +351,39 @@ pub fn create(cfg: &Config, branch: Option<String>) -> i32 {
         }
     }
 
-    // start-point order: existing local branch → origin/<base> → local <base>
-    let added = if git::ref_exists(&cfg.repo, &format!("refs/heads/{branch}")) {
-        git::worktree_add_existing(&cfg.repo, &wt, &branch)
-    } else if git::ref_exists(&cfg.repo, &format!("refs/remotes/origin/{}", cfg.base)) {
-        git::worktree_add_new(&cfg.repo, &wt, &branch, &format!("origin/{}", cfg.base))
-    } else if git::ref_exists(&cfg.repo, &format!("refs/heads/{}", cfg.base)) {
-        git::worktree_add_new(&cfg.repo, &wt, &branch, &cfg.base)
-    } else {
-        eprintln!("dcw: error: neither origin/{} nor local {} exists in {}.", cfg.base, cfg.base, cfg.repo.display());
-        eprintln!("       fetch the base branch, or set DEV_CAPTAIN_BASE=<branch>.");
+    // The DB clone only reads $REPO and the branch name, so it runs alongside the
+    // checkout (which is the other slow half of `dcw new`) instead of after it.
+    // `None` means the start point is missing; `Some(false)`, the checkout failed.
+    let ((db_lines, db_created), added) = std::thread::scope(|s| {
+        let db = s.spawn(|| db::db_clone(cfg, &branch));
+        // start-point order: existing local branch → origin/<base> → local <base>
+        let result = if git::ref_exists(&cfg.repo, &format!("refs/heads/{branch}")) {
+            git::worktree_add_existing(&cfg.repo, &wt, &branch)
+        } else if git::ref_exists(&cfg.repo, &format!("refs/remotes/origin/{}", cfg.base)) {
+            git::worktree_add_new(&cfg.repo, &wt, &branch, &format!("origin/{}", cfg.base))
+        } else if git::ref_exists(&cfg.repo, &format!("refs/heads/{}", cfg.base)) {
+            git::worktree_add_new(&cfg.repo, &wt, &branch, &cfg.base)
+        } else {
+            eprintln!("dcw: error: neither origin/{} nor local {} exists in {}.", cfg.base, cfg.base, cfg.repo.display());
+            eprintln!("       fetch the base branch, or set DEV_CAPTAIN_BASE=<branch>.");
+            return ((Vec::new(), false), None);
+        };
+        let db = db.join().unwrap_or_default();
+        (db, Some(result))
+    });
+    if !matches!(added, Some(true)) {
+        // Don't leave a cloned DB behind for a worktree that was never created.
+        if db_created {
+            db::db_drop(cfg, &branch);
+        }
+        if added.is_some() {
+            eprintln!("dcw: error: could not add worktree for {branch}");
+            return 1;
+        }
         return 2;
-    };
-    if !added {
-        eprintln!("dcw: error: could not add worktree for {branch}");
-        return 1;
+    }
+    for line in db_lines {
+        println!("{line}");
     }
 
     // copy .env from main repo into the worktree
@@ -387,7 +401,6 @@ pub fn create(cfg: &Config, branch: Option<String>) -> i32 {
     }
 
     db::copy_private_paths(cfg, &branch);
-    db::db_clone(cfg, &branch);
     db::set_worktree_env(cfg, &branch);
 
     let port = match port_alloc(cfg, &branch) {
@@ -522,12 +535,12 @@ pub fn stop(cfg: &Config, name: Option<String>) -> i32 {
         None if target.dir == cfg.repo => cfg.port_base,
         None => {
             println!("no captain running for {}", target.name);
-            celery::celery_stop(cfg, &target.name);
+            celery::celery_stop(cfg, &target.name, 2);
             return 0;
         }
     };
-    kill_port(cfg, port);
-    celery::celery_stop(cfg, &target.name);
+    kill_port(cfg, port, 2);
+    celery::celery_stop(cfg, &target.name, 2);
     println!("✓ stopped {} (port {port}) — worktree/branch left intact", target.name);
     0
 }
@@ -617,10 +630,12 @@ fn confirm_cached() -> bool {
 /// not something dcw created — only the ref matching the worktree name is.
 pub fn abort_one(cfg: &Config, name: &str, wt: &Path, port: Option<u16>) {
     if let Some(port) = port {
-        kill_port(cfg, port);
+        kill_port(cfg, port, 0);
         port_free(cfg, &port.to_string());
     }
-    celery::celery_stop(cfg, name);
+    // The worktree (and its DB) is about to go, so the worker's queues and in-flight
+    // tasks have nowhere to land: skip the graceful drain entirely.
+    celery::celery_stop(cfg, name, 0);
     // Capture what is checked out before the worktree goes away.
     let checked_out = git::current_branch(wt);
     if wt.exists() && !git::worktree_remove(&cfg.repo, wt) {
