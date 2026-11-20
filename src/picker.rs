@@ -56,7 +56,8 @@ fn port_num(s: &str) -> u16 {
 /// Every dcw-managed worktree, sorted up-first then by port, with port + status.
 /// Registry entries are looked up by WORKTREE NAME first, then by the checked-out
 /// branch (older entries); a switched worktree therefore still shows its own port
-/// and status.
+/// and status. The main checkout ($REPO) is not a managed worktree and is excluded;
+/// callers that should offer it add it explicitly.
 fn worktree_rows(cfg: &Config) -> Vec<WtRow> {
     let reg = registry::load(&cfg.reg_file);
     // branch/name -> (port, pid)
@@ -290,21 +291,43 @@ pub fn jump_pick(cfg: &Config) -> i32 {
     0
 }
 
-/// start: pick a single stopped worktree and start it.
+/// True when the base checkout's server is running (pid alive per registry, or port bound).
+fn base_running(cfg: &Config) -> bool {
+    let reg = registry::load(&cfg.reg_file);
+    if let Some(info) = reg.get(&cfg.port_base.to_string()) {
+        if info.pid > 0 && process::pid_alive(info.pid) {
+            return true;
+        }
+    }
+    process::port_bound(cfg.port_base)
+}
+
+/// start: pick a stopped target and start it (managed worktrees and, when down, the
+/// base checkout — repo utama — which runs in $REPO itself, not a worktree).
 pub fn start_pick(cfg: &Config) -> i32 {
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        eprintln!("usage: dcw start <worktree>   (run it in a terminal to pick from a list)");
+        eprintln!("usage: dcw start <target>   (run it in a terminal to pick from a list)");
         return 2;
     }
-    let rows: Vec<Row> = worktree_rows(cfg)
+    let mut rows: Vec<Row> = worktree_rows(cfg)
         .iter()
         .filter(|r| r.status == "down")
         .map(wt_menu_row)
         .collect();
+    if cfg.repo.is_dir() && !base_running(cfg) {
+        rows.insert(
+            0,
+            Row {
+                // Same "(repo)" label `dcw list` uses; the value stays cfg.base so
+                // find_target resolves it through the base-branch path.
+                display: format!("{:<32} {:<7} {}", "(repo)", cfg.port_base, "down"),
+                value: cfg.base.clone(),
+            },
+        );
+    }
     if rows.is_empty() {
         eprintln!(
-            "no stopped worktrees under {} — create one with 'dcw new <branch>'",
-            cfg.wt_dir.display()
+            "no stopped targets — create one with 'dcw new <branch>', or check 'dcw list'"
         );
         return 1;
     }
@@ -315,24 +338,67 @@ pub fn start_pick(cfg: &Config) -> i32 {
     commands::start(cfg, Some(name))
 }
 
-/// stop: multi-select worktrees to stop.
+/// stop: multi-select targets to stop (managed worktrees and the base checkout).
 pub fn stop_pick(cfg: &Config) -> i32 {
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        eprintln!("usage: dcw stop <worktree>   (run it in a terminal to pick from a list)");
+        eprintln!("usage: dcw stop <target>   (run it in a terminal to pick from a list)");
         return 2;
     }
-    let rows = worktree_rows(cfg);
-    if rows.is_empty() {
-        eprintln!(
-            "no worktrees under {} — nothing to stop",
-            cfg.wt_dir.display()
+    let mut rows = worktree_rows(cfg);
+    if cfg.repo.is_dir() {
+        let status = if base_running(cfg) { "up" } else { "down" };
+        rows.insert(
+            0,
+            WtRow {
+                name: "(repo)".into(),
+                branch: cfg.base.clone(),
+                dir: cfg.repo.clone(),
+                port: cfg.port_base.to_string(),
+                status: status.to_string(),
+            },
         );
+    }
+    if rows.is_empty() {
+        eprintln!("no targets — nothing to stop");
         return 1;
     }
     let menu: Vec<Row> = rows.iter().map(wt_menu_row).collect();
     let picked = run_menu(menu, "WORKTREE  PORT  STATUS", true);
     for name in picked {
         commands::stop(cfg, Some(name));
+    }
+    0
+}
+
+/// restart: multi-select targets to stop then start (managed worktrees and the base
+/// checkout). Same rows as stop_pick, but each pick goes through commands::restart.
+pub fn restart_pick(cfg: &Config) -> i32 {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        eprintln!("usage: dcw restart <target>   (run it in a terminal to pick from a list)");
+        return 2;
+    }
+    let mut rows = worktree_rows(cfg);
+    if cfg.repo.is_dir() {
+        let status = if base_running(cfg) { "up" } else { "down" };
+        rows.insert(
+            0,
+            WtRow {
+                name: "(repo)".into(),
+                branch: cfg.base.clone(),
+                dir: cfg.repo.clone(),
+                port: cfg.port_base.to_string(),
+                status: status.to_string(),
+            },
+        );
+    }
+    if rows.is_empty() {
+        eprintln!("no targets — nothing to restart");
+        return 1;
+    }
+    let menu: Vec<Row> = rows.iter().map(wt_menu_row).collect();
+    let picked = run_menu(menu, "WORKTREE  PORT  STATUS", true);
+    for name in picked {
+        commands::restart(cfg, Some(name));
     }
     0
 }

@@ -27,7 +27,7 @@ dcw init --yes --repo ~/work/hmx --venv ~/work/venv --port-base 5300 --port-max 
 
 ```
 dcw new <branch>        buat worktree (clone DB + file privat + namespace Redis), jalankan, lalu cd ke folder hmx-nya
-dcw start [worktree]    jalankan server+worker untuk worktree yang SUDAH ADA
+dcw start [worktree]    jalankan server+worker untuk worktree ATAU repo utama yang SUDAH ADA
 dcw stop [worktree]     stop server+worker (worktree & DB tetap)
 dcw restart [worktree]  stop lalu start server+worker (worktree & DB tetap)
 dcw jump                pilih worktree → cd ke folder hmx-nya
@@ -41,13 +41,22 @@ dcw uninstall           hapus dcw dari mesin
 ```
 
 **`new` vs `start`**: `new` hanya untuk worktree yang belum ada; `start` hanya yang sudah
-ada. Tanpa argumen, `start`/`stop`/`abort`/`logs`/`jump` membuka **menu panah** (butuh TTY;
-di script/cron, sebut worktree secara eksplisit).
+ada. Tanpa argumen, `start`/`stop`/`restart`/`abort`/`logs`/`jump` membuka **menu panah**
+(butuh TTY; di script/cron, sebut worktree secara eksplisit).
 
 **Identitas = nama worktree, bukan nama branch.** `dcw start`/`stop`/`restart`/`abort`/
 `logs` menerima nama direktori worktree (mis. `PRD_INV_00296`), karena satu worktree bisa
 di-`git switch` ke branch lain kapan saja. Nama branch tetap diterima sebagai alias dan
 diresolusi ke worktree yang memilikinya, tetapi output selalu menyebut nama worktree.
+
+**Repo utama juga bisa di-start.** Selain worktree, `dcw start` menerima repo utama
+(yang di `dcw list` tampil sebagai `(repo)`) dengan empat cara: nama base branch
+(mis. `dcw start Inventory`), label `(repo)`, path repo (`dcw start .` dari dalam repo,
+atau path absolut). Server-nya selalu jalan di `$REPO` pada `PORT_BASE`, log ke
+`logs/main.log`. `dcw stop`/`restart` menerima keempat bentuk itu juga, dan menu
+`dcw start`/`stop` ikut menampilkan baris `(repo)` saat captain-nya mati (`dcw abort`
+tetap menolak repo utama). Bila checkout utama sedang memegang branch lain, dcw
+memberi peringatan bahwa yang dilayani adalah branch itu.
 
 `dcw jump` dan `dcw new` butuh fungsi shell `dcw()` yang ditulis oleh `dcw init --bin`
 (buka terminal baru setelahnya) — keduanya melakukan `cd` ke shell pemanggil: `jump`
