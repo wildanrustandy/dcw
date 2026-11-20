@@ -25,6 +25,9 @@ pub struct PortInfo {
 
 pub type Registry = BTreeMap<String, PortInfo>;
 
+/// Distinguishes concurrent `save()` calls within one process (see save()).
+static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 pub fn load(reg: &Path) -> Registry {
     match std::fs::read_to_string(reg) {
         Ok(text) => match serde_json::from_str(&text) {
@@ -51,7 +54,13 @@ pub fn save(reg: &Path, data: &Registry) {
     let Ok(json) = serde_json::to_string_pretty(data) else {
         return;
     };
-    let tmp = parent.join(format!(".ports.json.tmp.{}", std::process::id()));
+    // Unique per call, not per process: two saves running at once (a scoped thread in
+    // `dcw new`) would otherwise share one temp file and truncate each other's rename.
+    let tmp = parent.join(format!(
+        ".ports.json.tmp.{}.{}",
+        std::process::id(),
+        TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     let write = std::fs::File::create(&tmp).and_then(|mut f| f.write_all(json.as_bytes()));
     if write.is_err() || std::fs::rename(&tmp, reg).is_err() {
         let _ = std::fs::remove_file(&tmp);
