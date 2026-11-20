@@ -41,8 +41,8 @@ dcw uninstall           hapus dcw dari mesin
 ```
 
 **`new` vs `start`**: `new` hanya untuk worktree yang belum ada; `start` hanya yang sudah
-ada. Tanpa argumen, `start`/`stop`/`abort`/`logs`/`jump` membuka **menu panah** (butuh TTY;
-di script/cron, sebut worktree secara eksplisit).
+ada. Tanpa argumen, `start`/`stop`/`restart`/`abort`/`logs`/`jump` membuka **menu panah**
+(butuh TTY; di script/cron, sebut worktree secara eksplisit).
 
 **Identitas = nama worktree, bukan nama branch.** `dcw start`/`stop`/`restart`/`abort`/
 `logs` menerima nama direktori worktree (mis. `PRD_INV_00296`), karena satu worktree bisa

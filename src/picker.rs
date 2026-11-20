@@ -370,6 +370,39 @@ pub fn stop_pick(cfg: &Config) -> i32 {
     0
 }
 
+/// restart: multi-select targets to stop then start (managed worktrees and the base
+/// checkout). Same rows as stop_pick, but each pick goes through commands::restart.
+pub fn restart_pick(cfg: &Config) -> i32 {
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        eprintln!("usage: dcw restart <target>   (run it in a terminal to pick from a list)");
+        return 2;
+    }
+    let mut rows = worktree_rows(cfg);
+    if cfg.repo.is_dir() {
+        let status = if base_running(cfg) { "up" } else { "down" };
+        rows.insert(
+            0,
+            WtRow {
+                name: "(repo)".into(),
+                branch: cfg.base.clone(),
+                dir: cfg.repo.clone(),
+                port: cfg.port_base.to_string(),
+                status: status.to_string(),
+            },
+        );
+    }
+    if rows.is_empty() {
+        eprintln!("no targets — nothing to restart");
+        return 1;
+    }
+    let menu: Vec<Row> = rows.iter().map(wt_menu_row).collect();
+    let picked = run_menu(menu, "WORKTREE  PORT  STATUS", true);
+    for name in picked {
+        commands::restart(cfg, Some(name));
+    }
+    0
+}
+
 /// abort: multi-select worktrees to destroy (with a combined confirmation).
 pub fn abort_pick(cfg: &Config) -> i32 {
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {

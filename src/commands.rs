@@ -136,6 +136,7 @@ fn pid_for_port(cfg: &Config, port: u16) -> Option<i32> {
 }
 
 fn record_pid(cfg: &Config, port: u16, branch: &str, pid: i32) {
+    let _lock = Lock::acquire(cfg.lock_dir.clone());
     let mut reg = registry::load(&cfg.reg_file);
     let key = port.to_string();
     let started_at = Some(
@@ -221,6 +222,7 @@ fn kill_port(cfg: &Config, port: u16) {
         process::signal(pid, nix::sys::signal::Signal::SIGKILL);
     }
     // clear pid (keep the entry for the base branch; drop the entry otherwise).
+    let _lock = Lock::acquire(cfg.lock_dir.clone());
     let mut reg = registry::load(&cfg.reg_file);
     let key = port.to_string();
     if let Some(info) = reg.get_mut(&key) {
@@ -538,7 +540,7 @@ pub fn restart(cfg: &Config, name: Option<String>) -> i32 {
     ensure_dirs(cfg);
     let name = match name {
         Some(b) => b,
-        None => return crate::picker::stop_pick(cfg),
+        None => return crate::picker::restart_pick(cfg),
     };
     let code = stop(cfg, Some(name.clone()));
     if code != 0 {
