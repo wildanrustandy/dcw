@@ -7,6 +7,7 @@ mod db;
 mod git;
 mod picker;
 mod process;
+mod progress;
 mod registry;
 mod setup;
 
