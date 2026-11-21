@@ -46,23 +46,25 @@ fn celery_ready(cfg: &Config, branch: &str) -> bool {
 }
 
 /// Start the worker. `wait` = block until ready (explicit `dcw celery start`), else
-/// only confirm it survived startup (the `dcw create` fast path). Returns Ok(pid)
-/// when a worker is up, Err(()) when a requested worker did not come up.
-pub fn celery_start(cfg: &Config, branch: &str, wait: bool) -> Result<i32, ()> {
+/// only confirm it survived startup (the `dcw create` fast path). `quiet` drops the
+/// routine status rows for a caller that draws its own checklist; warnings and
+/// failures still go to stderr. Returns Ok(pid) when a worker is up, Err(()) when a
+/// requested worker did not come up.
+pub fn celery_start(cfg: &Config, branch: &str, wait: bool, quiet: bool) -> Result<i32, ()> {
     if !cfg.celery_enabled {
-        println!("  celery:  skipped (DCW_CELERY=0)");
+        println!("  celery    skipped (DCW_CELERY=0)");
         return Err(());
     }
     if let Some(pid) = celery_pid(cfg, branch) {
-        println!("  celery:  already running (pid {pid})");
+        println!("  celery    already running (pid {pid})");
         return Ok(pid);
     }
     let Some(root) = django_root(cfg, branch) else {
-        eprintln!("  celery:  django root not found; worker NOT started");
+        eprintln!("  celery    django root not found; worker NOT started");
         return Err(());
     };
     let Some(celery_bin) = process::venv_bin(&cfg.venv, "celery") else {
-        eprintln!("  celery:  celery binary not found; worker NOT started");
+        eprintln!("  celery    celery binary not found; worker NOT started");
         return Err(());
     };
 
@@ -80,7 +82,7 @@ pub fn celery_start(cfg: &Config, branch: &str, wait: bool) -> Result<i32, ()> {
     let pid = match process::spawn_detached(&root, &log, celery_bin.to_str().unwrap_or("celery"), &args) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("  celery:  failed to spawn worker: {e}");
+            eprintln!("  celery    failed to spawn worker: {e}");
             return Err(());
         }
     };
@@ -100,7 +102,7 @@ pub fn celery_start(cfg: &Config, branch: &str, wait: bool) -> Result<i32, ()> {
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
     let Some(pid) = got else {
-        eprintln!("  celery:  worker did NOT start (server is unaffected); last log lines:");
+        eprintln!("  celery    worker did NOT start (server is unaffected); last log lines:");
         tail(log, 15);
         let _ = std::fs::remove_file(&pf);
         return Err(());
@@ -112,7 +114,7 @@ pub fn celery_start(cfg: &Config, branch: &str, wait: bool) -> Result<i32, ()> {
     for _ in 0..budget {
         if celery_pid(cfg, branch).is_none() {
             // died
-            eprintln!("  celery:  worker died during startup (server is unaffected); last log lines:");
+            eprintln!("  celery    worker died during startup (server is unaffected); last log lines:");
             tail(log, 15);
             let _ = std::fs::remove_file(&pf);
             return Err(());
@@ -126,15 +128,19 @@ pub fn celery_start(cfg: &Config, branch: &str, wait: bool) -> Result<i32, ()> {
 
     let ns = celery_namespace(cfg, branch);
     if ready {
-        println!("  celery:  worker up (pid {pid}, ns {ns})");
+        if !quiet {
+            println!("  celery    worker up (pid {pid}, ns {ns})");
+        }
         return Ok(pid);
     }
     if wait {
-        eprintln!("  celery:  worker alive but never became ready (~60s); see {}", log.display());
+        eprintln!("  celery    worker alive but never became ready (~60s); see {}", log.display());
         return Err(());
     }
-    println!("  celery:  worker starting (pid {pid}, ns {ns})");
-    println!("           HMX module load takes ~15-30s; watch: dcw logs {branch} celery");
+    if !quiet {
+        println!("  celery    worker starting (pid {pid}, ns {ns})");
+        println!("  {:<8}  HMX module load takes ~15-30s; watch: dcw logs {branch} celery", "");
+    }
     Ok(pid)
 }
 
@@ -144,15 +150,25 @@ pub fn celery_start(cfg: &Config, branch: &str, wait: bool) -> Result<i32, ()> {
 /// shutdown drains a broker whose queues exist for this worktree alone and takes ~5-7s
 /// — and every caller either relaunches (`restart`) or discards (`abort`) that
 /// worktree right after, so a short window is enough; `abort` passes 0.
-pub fn celery_stop(cfg: &Config, branch: &str, grace_secs: u64) {
+///
+/// `note` receives each phase, so a caller drawing a progress block can show it on its
+/// own row instead of interleaving plain lines.
+pub fn celery_stop(cfg: &Config, branch: &str, grace_secs: u64, note: &dyn Fn(&str)) {
     let Some(pid) = celery_pid(cfg, branch) else {
         let _ = std::fs::remove_file(pidfile(cfg, branch));
-        println!("  celery:  not running");
+        note("worker not running");
         return;
     };
+    note(&format!("stopping worker (pid {pid})"));
     process::stop_group(pid, grace_secs);
     let _ = std::fs::remove_file(pidfile(cfg, branch));
-    println!("  celery:  stopped (pid {pid})");
+    note(&format!("worker stopped (pid {pid})"));
+}
+
+/// Stop the worker and print each phase as a plain line (the default for callers that
+/// are not drawing a progress block).
+pub fn celery_stop_print(cfg: &Config, branch: &str, grace_secs: u64) {
+    celery_stop(cfg, branch, grace_secs, &|m| println!("  celery    {m}"));
 }
 
 /// Print the tail of a log file (best-effort).

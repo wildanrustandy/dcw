@@ -1,6 +1,7 @@
 // commands.rs — the subcommand handlers and the port/server lifecycle.
 
 use crate::config::Config;
+use crate::progress::TaskHandle;
 use crate::registry::{self, Lock, Registry};
 use crate::{celery, db, git, process};
 use std::path::{Path, PathBuf};
@@ -342,87 +343,94 @@ pub fn create(cfg: &Config, branch: Option<String>) -> i32 {
     }
 
     // fetch so a new branch starts at the latest remote commit
-    let progress = crate::progress::Progress::start(&format!("fetch origin/{}", cfg.base));
-    let (ok, msg) = git::fetch_origin(&cfg.repo, &cfg.base);
-    if !ok {
+    let progress = crate::progress::Progress::start();
+    let fetch_row = progress.task(&format!("fetch origin/{}", cfg.base), "");
+    let (fetch_ok, _msg) = git::fetch_origin(&cfg.repo, &cfg.base);
+    fetch_row.done();
+    if !fetch_ok {
         eprintln!("dcw: warning: git fetch origin failed; using existing local refs");
-    } else if !msg.trim().is_empty() {
-        for line in msg.lines().rev().take(3).collect::<Vec<_>>().iter().rev() {
-            println!("{line}");
-        }
     }
 
-    // The DB clone only reads $REPO and the branch name, so it runs alongside the
-    // checkout (which is the other slow half of `dcw new`) instead of after it.
-    // The DB clone and the checkout both run on their own threads while a sampler turns
-    // "files written / files in the tree" into the bar's percentage — both measured,
-    // nothing estimated.
-    // `None` = the start point is missing; the `bool` = the checkout result.
-    let outcome = std::thread::scope(|s| {
-        let db = s.spawn(|| db::db_clone(cfg, &branch));
-        // start-point order: existing local branch → origin/<base> → local <base>
-        let (start, rev) = if git::ref_exists(&cfg.repo, &format!("refs/heads/{branch}")) {
-            (None, branch.clone())
-        } else if git::ref_exists(&cfg.repo, &format!("refs/remotes/origin/{}", cfg.base)) {
-            (Some(format!("origin/{}", cfg.base)), format!("origin/{}", cfg.base))
-        } else if git::ref_exists(&cfg.repo, &format!("refs/heads/{}", cfg.base)) {
-            (Some(cfg.base.clone()), cfg.base.clone())
-        } else {
-            let (d, c) = db.join().unwrap_or_default();
-            return (d, c, None);
-        };
-        let total = crate::progress::checkout_file_count(&cfg.repo, &rev);
-        let (wt_for_sampler, progress_ref) = (wt.clone(), &progress);
-        let sampler = s.spawn(move || {
-            while progress_ref
-                .set_written(crate::progress::files_written(&wt_for_sampler), total)
-            {
-                std::thread::sleep(std::time::Duration::from_millis(150));
-            }
-        });
-        let added = match start {
-            Some(start) => git::worktree_add_new(&cfg.repo, &wt, &branch, &start),
-            None => git::worktree_add_existing(&cfg.repo, &wt, &branch),
-        };
-        let _ = sampler.join();
-        let (d, c) = db.join().unwrap_or_default();
-        (d, c, Some(added))
-    });
-    progress.stop();
-    let (db_lines, db_created, added) = outcome;
-    let Some(added) = added else {
+    // start-point order: existing local branch → origin/<base> → local <base>. Resolved
+    // before the parallel work so the two rows can be created in display order.
+    let (start, rev) = if git::ref_exists(&cfg.repo, &format!("refs/heads/{branch}")) {
+        (None, branch.clone())
+    } else if git::ref_exists(&cfg.repo, &format!("refs/remotes/origin/{}", cfg.base)) {
+        (Some(format!("origin/{}", cfg.base)), format!("origin/{}", cfg.base))
+    } else if git::ref_exists(&cfg.repo, &format!("refs/heads/{}", cfg.base)) {
+        (Some(cfg.base.clone()), cfg.base.clone())
+    } else {
+        progress.stop();
         eprintln!("dcw: error: neither origin/{} nor local {} exists in {}.", cfg.base, cfg.base, cfg.repo.display());
         eprintln!("       fetch the base branch, or set DEV_CAPTAIN_BASE=<branch>.");
         return 2;
     };
+
+    let total = crate::progress::checkout_file_count(&cfg.repo, &rev);
+    let checkout_row = progress.task("checkout", "");
+    let db_row = progress.task("database", "cloning template");
+
+    // The DB clone only reads $REPO and the branch name, so it runs alongside the
+    // checkout (the other slow half of `dcw new`) instead of after it. The checkout row is
+    // filled from "files written / files in the tree" — both measured, not estimated.
+    let (db_lines, db_created, added) = std::thread::scope(|s| {
+        let db = s.spawn(|| {
+            let result = db::db_clone(cfg, &branch);
+            db_row.done();
+            result
+        });
+        let (wt_for_sampler, row) = (wt.clone(), checkout_row.clone());
+        let sampler = s.spawn(move || {
+            while row.set_written(crate::progress::files_written(&wt_for_sampler), total) {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+        });
+        let added = match &start {
+            Some(start) => git::worktree_add_new(&cfg.repo, &wt, &branch, start),
+            None => git::worktree_add_existing(&cfg.repo, &wt, &branch),
+        };
+        let _ = sampler.join();
+        checkout_row.done();
+        let (d, c) = db.join().unwrap_or_default();
+        (d, c, added)
+    });
     if !added {
         // Don't leave a cloned DB behind for a worktree that was never created.
         if db_created {
-            db::db_drop(cfg, &branch);
+            db::db_drop(cfg, &branch, &|m| eprintln!("  db:      {m}"));
         }
+        progress.stop();
         eprintln!("dcw: error: could not add worktree for {branch}");
         return 1;
     }
-    for line in db_lines {
-        println!("{line}");
+    // The clone's routine lines duplicate the progress row; only its warnings add
+    // information the bar cannot show (a fallback to dump/restore, a skipped clone).
+    for line in &db_lines {
+        if line.contains("warning") || line.contains("failed") || line.contains("skipped") {
+            eprintln!("{line}");
+        }
     }
 
-    // copy .env from main repo into the worktree
-    for name in ["hmx/.env".to_string(), ".env".to_string()] {
-        let src = cfg.repo.join(&name);
-        let dst = cfg.dir_for(&branch).join(&name);
+    // .env first (the worktree's own copy), then the private files and the per-worktree
+    // .env/.db.json values. All of it is reported as a few summary rows, not one per path.
+    let config_row = progress.task("config", "");
+    for name in ["hmx/.env", ".env"] {
+        let src = cfg.repo.join(name);
+        let dst = cfg.dir_for(&branch).join(name);
         if src.is_file() && !dst.exists() {
             if let Some(parent) = dst.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            if std::fs::copy(&src, &dst).is_ok() {
-                println!("  env:     copied {} → worktree", name);
-            }
+            let _ = std::fs::copy(&src, &dst);
         }
     }
 
-    db::copy_private_paths(cfg, &branch);
-    db::set_worktree_env(cfg, &branch);
+    // Side effects only: the paths and the .env/.db.json values are written, but the
+    // checklist above is the whole output of `dcw new`, so they print nothing.
+    let _ = db::copy_private_paths(cfg, &branch);
+    let _ = db::set_worktree_env(cfg, &branch);
+    config_row.done();
+    progress.stop();
 
     let port = match port_alloc(cfg, &branch) {
         Ok(p) => p,
@@ -436,7 +444,7 @@ pub fn create(cfg: &Config, branch: Option<String>) -> i32 {
         dir: wt,
         branch: Some(branch.clone()),
     };
-    let code = bring_up(cfg, &target, port, false);
+    let code = bring_up(cfg, &target, port, false, true);
     if code == 0 {
         // Let the installed `dcw` shell function cd the CALLING shell into the new
         // worktree. A child process cannot cd its parent, so the path goes through
@@ -492,7 +500,7 @@ pub fn start(cfg: &Config, name: Option<String>) -> i32 {
                 eprintln!("         run 'git -C {} switch {}' to serve {}.", cfg.repo.display(), cfg.base, cfg.base);
             }
         }
-        return bring_up(cfg, &target, cfg.port_base, true);
+        return bring_up(cfg, &target, cfg.port_base, true, false);
     }
 
     let port = match port_alloc(cfg, &target.name) {
@@ -502,41 +510,60 @@ pub fn start(cfg: &Config, name: Option<String>) -> i32 {
             return 1;
         }
     };
-    bring_up(cfg, &target, port, false)
+    bring_up(cfg, &target, port, false, false)
 }
 
 /// Allocate/announce the port and start server + worker for an existing tree.
 /// Shared by `new` (after creation) and `start`. The target's NAME keys the port,
 /// the log file, the celery pidfile, and the registry entry.
-fn bring_up(cfg: &Config, t: &Target, port: u16, base: bool) -> i32 {
+///
+/// `quiet` = the caller already showed a progress block and only wants the preview
+/// URL (`dcw new`); routine status rows are dropped, but warnings and failures
+/// (port reserved but not started, worker did not come up) are always printed.
+fn bring_up(cfg: &Config, t: &Target, port: u16, base: bool, quiet: bool) -> i32 {
     if let Some(pid) = pid_for_port(cfg, port) {
         println!("✓ {} already running (pid {pid}) on port {port}", t.name);
         println!("  preview: {}", cfg.url_for(port, &t.name));
-        let _ = celery::celery_start(cfg, &t.name, false);
+        let _ = celery::celery_start(cfg, &t.name, false, quiet);
         return 0;
     }
     let log = server_log(cfg, &t.name);
     match start_server(cfg, &t.dir, port, &t.name) {
+        Some(pid) if quiet => {
+            // The caller's checklist is the output; the URL is the one thing it
+            // cannot show, since it is allocated here.
+            let _ = pid;
+            println!("  {}", cfg.url_for(port, &t.name));
+        }
         Some(pid) => {
             if base {
                 println!("✓ captain started: {} (base)", t.name);
-                println!("  dir:     {}", t.dir.display());
             } else {
                 println!("✓ captain started: {}", t.name);
-                println!("  worktree: {}", t.dir.display());
+            }
+            // One label column: every label padded to the longest, so the values line up.
+            let mut rows: Vec<(&str, String)> = Vec::new();
+            if base {
+                rows.push(("dir", t.dir.display().to_string()));
+            } else {
+                rows.push(("worktree", t.dir.display().to_string()));
                 if let Some(branch) = &t.branch {
-                    println!("  branch:  {branch}");
+                    rows.push(("branch", branch.clone()));
                 }
             }
-            println!("  port:    {port}  (pid {pid})");
-            println!("  preview: {}", cfg.url_for(port, &t.name));
-            println!("  log:     {}", log.display());
+            rows.push(("port", format!("{port}  (pid {pid})")));
+            rows.push(("preview", cfg.url_for(port, &t.name)));
+            rows.push(("log", log.display().to_string()));
+            let width = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+            for (label, value) in rows {
+                println!("  {label:<width$}  {value}");
+            }
         }
         None => {
             println!("⚠ port {port} reserved; server NOT started (spawn manually when ready)");
         }
     }
-    let _ = celery::celery_start(cfg, &t.name, false);
+    let _ = celery::celery_start(cfg, &t.name, false, quiet);
     0
 }
 
@@ -556,12 +583,12 @@ pub fn stop(cfg: &Config, name: Option<String>) -> i32 {
         None if target.dir == cfg.repo => cfg.port_base,
         None => {
             println!("no captain running for {}", target.name);
-            celery::celery_stop(cfg, &target.name, 2);
+            celery::celery_stop_print(cfg, &target.name, 2);
             return 0;
         }
     };
     kill_port(cfg, port, 2);
-    celery::celery_stop(cfg, &target.name, 2);
+    celery::celery_stop_print(cfg, &target.name, 2);
     println!("✓ stopped {} (port {port}) — worktree/branch left intact", target.name);
     0
 }
@@ -607,7 +634,10 @@ pub fn abort(cfg: &Config, name: Option<String>) -> i32 {
         return 1;
     }
     println!();
-    abort_one(cfg, &target.name, &target.dir, port);
+    let progress = crate::progress::Progress::start();
+    let row = progress.task(&target.name, "");
+    abort_one(cfg, &target.name, &target.dir, port, &row);
+    progress.stop();
     0
 }
 
@@ -649,27 +679,32 @@ fn confirm_cached() -> bool {
 /// `name` is the WORKTREE name (dcw's identity, and the DB name). The branch ref
 /// that a `git switch` put in the worktree is NOT deleted — that is the user's work,
 /// not something dcw created — only the ref matching the worktree name is.
-pub fn abort_one(cfg: &Config, name: &str, wt: &Path, port: Option<u16>) {
+///
+/// `row` is this target's progress row; every phase reports through it, so several
+/// aborts running at once never interleave their output.
+pub fn abort_one(cfg: &Config, name: &str, wt: &Path, port: Option<u16>, row: &TaskHandle) {
     if let Some(port) = port {
+        row.step("stopping server");
         kill_port(cfg, port, 0);
         port_free(cfg, &port.to_string());
     }
     // The worktree (and its DB) is about to go, so the worker's queues and in-flight
     // tasks have nowhere to land: skip the graceful drain entirely.
-    celery::celery_stop(cfg, name, 0);
+    celery::celery_stop(cfg, name, 0, &|m| row.step(m));
     // Capture what is checked out before the worktree goes away.
     let checked_out = git::current_branch(wt);
+    row.step("removing worktree");
     if wt.exists() && !git::worktree_remove(&cfg.repo, wt) {
-        eprintln!("dcw: warning: could not remove worktree {}", wt.display());
+        row.step(&format!("warning: could not remove {}", wt.display()));
     }
     git::branch_delete(&cfg.repo, name);
     if let Some(branch) = checked_out {
         if branch != name {
-            println!("  kept branch '{branch}' (checked out in the worktree; not created by dcw)");
+            row.step(&format!("kept branch '{branch}'"));
         }
     }
-    db::db_drop(cfg, name);
-    println!("✓ aborted {name}");
+    db::db_drop(cfg, name, &|m| row.step(m));
+    row.finish("aborted");
 }
 
 /// ── list ─────────────────────────────────────────────────────────

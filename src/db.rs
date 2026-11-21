@@ -169,17 +169,20 @@ pub fn db_clone(cfg: &Config, branch: &str) -> (Vec<String>, bool) {
 }
 
 /// Drop the branch's DB. Non-fatal (dcw warns and keeps the DB on failure).
-pub fn db_drop(cfg: &Config, branch: &str) {
+///
+/// `note` receives each phase the drop passes through, so a caller drawing a progress
+/// block can show it on its own row instead of interleaving plain lines.
+pub fn db_drop(cfg: &Config, branch: &str, note: &dyn Fn(&str)) {
     let dst = cfg.db_name(branch);
     let Some(conn) = (crate::process::which("dropdb").is_some()).then(|| conn_vars(cfg)) else {
-        eprintln!("  db:      dropdb not found; DB drop skipped");
+        note("dropdb not found; DB kept");
         return;
     };
     if !db_exists(&conn, &dst) {
-        println!("  db:      {dst} does not exist");
+        note("no DB to drop");
         return;
     }
-    println!("  db:      dropping {dst}");
+    note(&format!("dropping {dst}"));
     let ok = Command::new("dropdb")
         .env("PGPASSWORD", &conn.password)
         .args(["-w", "-h", &conn.host, "-p", &conn.port, "-U", &conn.user, "--if-exists", &dst])
@@ -189,7 +192,7 @@ pub fn db_drop(cfg: &Config, branch: &str) {
         .map(|s| s.success())
         .unwrap_or(false);
     if !ok {
-        eprintln!("  db:      warning: dropdb failed for {dst} (left in place)");
+        note(&format!("warning: dropdb failed for {dst} (left in place)"));
     }
 }
 
@@ -233,13 +236,14 @@ fn set_db_json(cfg: &Config, branch: &str) {
     }
     if let Ok(s) = serde_json::to_string_pretty(&v) {
         let _ = std::fs::write(&dbjson, s + "\n");
-        println!("  db.json: default.NAME = {dst}");
     }
 }
 
 /// Point the worktree .env's DATABASE_NAME at the branch DB, and give the worktree a
-/// distinct HMX_INSTANCE_NAMESPACE (the Redis isolation key), all in one pass.
-pub fn set_worktree_env(cfg: &Config, branch: &str) {
+/// distinct HMX_INSTANCE_NAMESPACE (the Redis isolation key), all in one pass. Returns
+/// (db_name, namespace) for the caller's summary line, or None when .env is missing
+/// (already reported on stderr).
+pub fn set_worktree_env(cfg: &Config, branch: &str) -> Option<(String, String)> {
     let env_file = cfg.dir_for(branch).join("hmx/.env");
     let dst = cfg.db_name(branch);
 
@@ -249,20 +253,20 @@ pub fn set_worktree_env(cfg: &Config, branch: &str) {
 
     if !set_env_line(&env_file, "DATABASE_NAME", &dst) {
         eprintln!("  .env:    {} not found; skipped", env_file.display());
-        return;
+        return None;
     }
-    println!("  .env:    DATABASE_NAME = {dst}");
 
     set_env_line(&env_file, "HMX_INSTANCE_NAMESPACE", &ns);
-    println!("  .env:    HMX_INSTANCE_NAMESPACE = {ns}");
-
     set_db_json(cfg, branch);
+    Some((dst, ns))
 }
 
 /// Copy the private per-user files/dirs from the main repo into a fresh worktree and
-/// git-exclude them so they never get committed.
-pub fn copy_private_paths(cfg: &Config, branch: &str) {
+/// git-exclude them so they never get committed. Returns how many landed, so `dcw new`
+/// can print one summary line instead of one per path.
+pub fn copy_private_paths(cfg: &Config, branch: &str) -> usize {
     let wt = cfg.dir_for(branch);
+    let mut copied = 0usize;
     for name in [".agents", ".claude", ".vscode", "AGENTS.md", "CLAUDE.md", "hmx/hmx/db.json"] {
         let src = cfg.repo.join(name);
         let dst = wt.join(name);
@@ -276,13 +280,16 @@ pub fn copy_private_paths(cfg: &Config, branch: &str) {
             // Dir entries (.agents, .claude, .vscode) need a recursive copy —
             // std::fs::copy only handles files and fails silently on a directory.
             match copy_tree(&src, &dst) {
-                Ok(()) => println!("  copy:    {}", dst.display()),
+                Ok(()) => copied += 1,
                 Err(e) => eprintln!("  copy:    warning: {src:?} -> {dst:?} failed: {e}"),
             }
         }
         add_git_exclude(&wt, name);
     }
-    sync_claude_md(cfg, &wt);
+    if sync_claude_md(cfg, &wt) {
+        copied += 1;
+    }
+    copied
 }
 
 /// Recursive copy (like `cp -a`): files, directories and symlinks.
@@ -308,25 +315,26 @@ fn copy_tree(src: &Path, dst: &Path) -> std::io::Result<()> {
 
 /// Mirror $REPO/CLAUDE.md into the worktree (skip-worktree), same as dcw: this clone
 /// tracks a symlink, so a fresh worktree would otherwise show /shared's content.
-fn sync_claude_md(cfg: &Config, wt: &std::path::Path) {
+/// Sync the main repo's CLAUDE.md into the worktree, git-excluded and marked
+/// skip-worktree so the copy never shows up as a change. True when a copy was made.
+fn sync_claude_md(cfg: &Config, wt: &std::path::Path) -> bool {
     let src = cfg.repo.join("CLAUDE.md");
     if !src.is_file() || std::fs::symlink_metadata(&src).map(|m| m.file_type().is_symlink()).unwrap_or(true)
     {
-        return;
+        return false;
     }
     let dst = wt.join("CLAUDE.md");
     let identical = dst.is_file()
         && !std::fs::symlink_metadata(&dst).map(|m| m.file_type().is_symlink()).unwrap_or(false)
         && std::fs::read(&src).ok() == std::fs::read(&dst).ok();
     if identical {
-        return;
+        return false;
     }
     let _ = std::fs::remove_file(&dst);
-    if std::fs::copy(&src, &dst).is_ok() {
-        println!("  copy:    {} <- {} (skip-worktree)", dst.display(), src.display());
-    }
+    let copied = std::fs::copy(&src, &dst).is_ok();
     add_git_exclude(wt, "CLAUDE.md");
     let _ = crate::git::git_status(wt, &["update-index", "--skip-worktree", "CLAUDE.md"]);
+    copied
 }
 
 /// Add a path to the worktree-local git exclude file (~/.git/info/exclude).
