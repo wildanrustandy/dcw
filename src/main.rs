@@ -20,8 +20,12 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Create a NEW worktree (clone DB, copy private files, set Redis namespace) and start it
-    New { branch: Option<String> },
+    /// Create NEW worktree(s) (clone DB, copy private files, set Redis namespace) and start them.
+    /// One name, or several: `dcw new a b` / `dcw new a,b,c`
+    New {
+        #[arg(value_delimiter = ',')]
+        branches: Vec<String>,
+    },
     /// Start server + worker for an EXISTING worktree (never creates one)
     Start {
         /// worktree name (its directory); a branch name resolves to its worktree
@@ -112,7 +116,7 @@ fn main() {
     let cli = Cli::parse();
     let cfg = config::Config::load();
     let code = match cli.command {
-        Commands::New { branch } => commands::create(&cfg, branch),
+        Commands::New { branches } => commands::create(&cfg, branches),
         Commands::Start { worktree } => commands::start(&cfg, worktree),
         Commands::Stop { worktree } => commands::stop(&cfg, worktree),
         Commands::Restart { worktree } => commands::restart(&cfg, worktree),
