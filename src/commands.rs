@@ -305,30 +305,109 @@ fn ensure_dirs(cfg: &Config) {
 }
 
 /// ── new ──────────────────────────────────────────────────────────
-/// Create a NEW worktree (clone DB, copy private files, set Redis namespace) and
-/// bring it up. Errors if the worktree already exists — running an existing one is
-/// `dcw start`'s job.
-pub fn create(cfg: &Config, branch: Option<String>) -> i32 {
+/// Create NEW worktree(s) and bring them up. Errors if a worktree already exists —
+/// running an existing one is `dcw start`'s job.
+///
+/// Several names run at once, at most `MAX_PARALLEL_NEW` at a time. The cap is not
+/// politeness: the checkout and `createdb -T` are disk-bound (measured at 94% disk
+/// utilisation), so extra concurrency buys little while costing ~1.3 GB of RAM per
+/// running worktree (server + worker) and a fifth of the free disk.
+pub fn create(cfg: &Config, branches: Vec<String>) -> i32 {
     ensure_dirs(cfg);
-    let branch = match branch {
-        Some(b) => b,
-        None => {
-            eprintln!("usage: dcw new <branch>   (create a worktree; 'dcw start' runs an existing one)");
-            return 2;
-        }
-    };
+    if branches.is_empty() {
+        eprintln!("usage: dcw new <branch> [branch...]   (create worktrees; 'dcw start' runs an existing one)");
+        return 2;
+    }
     if !cfg.repo.join(".git").exists() {
         eprintln!("error: {} is not a git repo — clone first", cfg.repo.display());
         return 2;
     }
+    if branches.len() == 1 {
+        return create_one(cfg, &branches[0], None);
+    }
 
+    // One fetch for the whole batch: every worktree starts from the same base ref, and
+    // fetching it once per target would just repeat the same network round trip.
+    let progress = crate::progress::Progress::start();
+    let fetch_row = progress.task(&format!("fetch origin/{}", cfg.base), "");
+    let (fetch_ok, _msg) = git::fetch_origin(&cfg.repo, &cfg.base);
+    fetch_row.done();
+    if !fetch_ok {
+        eprintln!("dcw: warning: git fetch origin failed; using existing local refs");
+    }
+    // Resolve the start point once: it is the same for every target in the batch.
+    let Some((start, rev)) = resolve_start(cfg, &branches[0]) else {
+        progress.stop();
+        return 2;
+    };
+
+    let rows: Vec<_> = branches.iter().map(|b| progress.task(b, "queued")).collect();
+    // A fixed set of workers pulling from a shared index, so at most MAX_PARALLEL_NEW
+    // checkouts and DB clones are ever in flight, however many names were given.
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let results: Vec<i32> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..MAX_PARALLEL_NEW.min(branches.len()))
+            .map(|_| {
+                let (next, start, rev, branches, rows) = (&next, &start, &rev, &branches, &rows);
+                s.spawn(move || {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(name) = branches.get(i) else { break };
+                        let row = &rows[i];
+                        done.push((i, create_one(cfg, name, Some((row, start.clone(), rev.clone())))));
+                    }
+                    done
+                })
+            })
+            .collect();
+        let mut codes = vec![0; branches.len()];
+        for w in workers {
+            for (i, code) in w.join().unwrap_or_default() {
+                codes[i] = code;
+            }
+        }
+        codes
+    });
+    progress.stop();
+    if results.iter().all(|c| *c == 0) {
+        0
+    } else {
+        1
+    }
+}
+
+/// Most `dcw new` targets built at the same time. See `create`.
+const MAX_PARALLEL_NEW: usize = 3;
+
+/// The start point for a new branch: an existing local branch (no start ref), else
+/// `origin/<base>`, else local `<base>`. `None` when none of them exists.
+fn resolve_start(cfg: &Config, branch: &str) -> Option<(Option<String>, String)> {
+    if git::ref_exists(&cfg.repo, &format!("refs/heads/{branch}")) {
+        Some((None, branch.to_string()))
+    } else if git::ref_exists(&cfg.repo, &format!("refs/remotes/origin/{}", cfg.base)) {
+        let r = format!("origin/{}", cfg.base);
+        Some((Some(r.clone()), r))
+    } else if git::ref_exists(&cfg.repo, &format!("refs/heads/{}", cfg.base)) {
+        Some((Some(cfg.base.clone()), cfg.base.clone()))
+    } else {
+        eprintln!("dcw: error: neither origin/{} nor local {} exists in {}.", cfg.base, cfg.base, cfg.repo.display());
+        eprintln!("       fetch the base branch, or set DEV_CAPTAIN_BASE=<branch>.");
+        None
+    }
+}
+
+/// Build one worktree and bring it up. `batch` carries the row to draw into and the
+/// start point already resolved by `create`; `None` means a single-target run, which
+/// does its own fetch, resolution, and progress block.
+fn create_one(cfg: &Config, branch: &str, batch: Option<(&TaskHandle, Option<String>, String)>) -> i32 {
     if branch == cfg.base {
         eprintln!("error: the base branch runs in {} itself, not in a worktree.", cfg.repo.display());
         eprintln!("       use 'dcw start {branch}' to run it.");
         return 2;
     }
 
-    let wt = cfg.dir_for(&branch);
+    let wt = cfg.dir_for(branch);
     if wt.exists() {
         eprintln!("error: worktree for {branch} already exists — use 'dcw start {branch}' to run it");
         return 2;
@@ -342,64 +421,99 @@ pub fn create(cfg: &Config, branch: Option<String>) -> i32 {
         }
     }
 
-    // fetch so a new branch starts at the latest remote commit
-    let progress = crate::progress::Progress::start();
-    let fetch_row = progress.task(&format!("fetch origin/{}", cfg.base), "");
-    let (fetch_ok, _msg) = git::fetch_origin(&cfg.repo, &cfg.base);
-    fetch_row.done();
-    if !fetch_ok {
-        eprintln!("dcw: warning: git fetch origin failed; using existing local refs");
-    }
-
-    // start-point order: existing local branch → origin/<base> → local <base>. Resolved
-    // before the parallel work so the two rows can be created in display order.
-    let (start, rev) = if git::ref_exists(&cfg.repo, &format!("refs/heads/{branch}")) {
-        (None, branch.clone())
-    } else if git::ref_exists(&cfg.repo, &format!("refs/remotes/origin/{}", cfg.base)) {
-        (Some(format!("origin/{}", cfg.base)), format!("origin/{}", cfg.base))
-    } else if git::ref_exists(&cfg.repo, &format!("refs/heads/{}", cfg.base)) {
-        (Some(cfg.base.clone()), cfg.base.clone())
-    } else {
-        progress.stop();
-        eprintln!("dcw: error: neither origin/{} nor local {} exists in {}.", cfg.base, cfg.base, cfg.repo.display());
-        eprintln!("       fetch the base branch, or set DEV_CAPTAIN_BASE=<branch>.");
-        return 2;
+    // Batch: the caller already fetched and resolved the start point, and handed us the
+    // row to draw into. Single: this call does both itself. Copy the batch data out so
+    // the rest of the function never borrows `batch` again.
+    let (batch_row, batch_start, batch_rev) = match &batch {
+        Some((r, start, rev)) => (Some(*r), Some(start.clone()), Some(rev.clone())),
+        None => (None, None, None),
     };
-
+    let (single, start, rev): (Option<crate::progress::Progress>, _, _) = match batch_rev {
+        Some(rev) => (None, batch_start.unwrap_or(None), rev),
+        None => {
+            let p = crate::progress::Progress::start();
+            let fetch_row = p.task(&format!("fetch origin/{}", cfg.base), "");
+            let (ok, _) = git::fetch_origin(&cfg.repo, &cfg.base);
+            fetch_row.done();
+            if !ok {
+                eprintln!("dcw: warning: git fetch origin failed; using existing local refs");
+            }
+            let Some((start, rev)) = resolve_start(cfg, branch) else {
+                p.stop();
+                return 2;
+            };
+            (Some(p), start, rev)
+        }
+    };
+    let checkout_row = single.as_ref().map(|p| p.task("checkout", ""));
+    let db_row = single.as_ref().map(|p| p.task("database", "cloning template"));
+    let config_row = single.as_ref().map(|p| p.task("config", ""));
+    // The row the checkout bar is drawn into: the batch's own row (one row per worktree)
+    // or, for a single target, its dedicated checkout row.
+    let bar_row: &TaskHandle = match (batch_row, &checkout_row) {
+        (Some(r), _) => r,
+        (None, Some(row)) => row,
+        // Unreachable: a single run always has a block, hence a row.
+        (None, None) => return 1,
+    };
+    // The row that reports the phases after the checkout: the batch's row (which stays
+    // live until the worktree is up) or, for a single target, the config row.
+    let phase_row: &TaskHandle = match (batch_row, &config_row) {
+        (Some(r), _) => r,
+        (None, Some(row)) => row,
+        (None, None) => return 1,
+    };
     let total = crate::progress::checkout_file_count(&cfg.repo, &rev);
-    let checkout_row = progress.task("checkout", "");
-    let db_row = progress.task("database", "cloning template");
+    // Stop sampling when the checkout is done, not when the count reaches 100%: the files
+    // git writes need not equal the count `ls-tree` reports (a skipped or generated path
+    // never lands), and a loop waiting for 100% would spin forever.
+    let checkout_done = std::sync::atomic::AtomicBool::new(false);
 
     // The DB clone only reads $REPO and the branch name, so it runs alongside the
     // checkout (the other slow half of `dcw new`) instead of after it. The checkout row is
     // filled from "files written / files in the tree" — both measured, not estimated.
     let (db_lines, db_created, added) = std::thread::scope(|s| {
         let db = s.spawn(|| {
-            let result = db::db_clone(cfg, &branch);
-            db_row.done();
+            let result = db::db_clone(cfg, branch);
+            if let Some(r) = &db_row {
+                r.done();
+            }
             result
         });
-        let (wt_for_sampler, row) = (wt.clone(), checkout_row.clone());
+        let (wt_for_sampler, row, done) = (wt.clone(), bar_row.clone(), &checkout_done);
         let sampler = s.spawn(move || {
-            while row.set_written(crate::progress::files_written(&wt_for_sampler), total) {
+            while !done.load(std::sync::atomic::Ordering::Relaxed) {
+                row.set_written(crate::progress::files_written(&wt_for_sampler), total);
                 std::thread::sleep(std::time::Duration::from_millis(150));
             }
         });
         let added = match &start {
-            Some(start) => git::worktree_add_new(&cfg.repo, &wt, &branch, start),
-            None => git::worktree_add_existing(&cfg.repo, &wt, &branch),
+            Some(start) => git::worktree_add_new(&cfg.repo, &wt, branch, start),
+            None => git::worktree_add_existing(&cfg.repo, &wt, branch),
         };
+        checkout_done.store(true, std::sync::atomic::Ordering::Relaxed);
         let _ = sampler.join();
-        checkout_row.done();
+        // Single run: the checkout row is its own row, so mark it finished here. A batch
+        // row is not done yet — it still has configuring and starting to report.
+        if batch_row.is_none() {
+            if let Some(r) = &checkout_row {
+                r.done();
+            }
+        }
         let (d, c) = db.join().unwrap_or_default();
         (d, c, added)
     });
     if !added {
         // Don't leave a cloned DB behind for a worktree that was never created.
         if db_created {
-            db::db_drop(cfg, &branch, &|m| eprintln!("  db:      {m}"));
+            db::db_drop(cfg, branch, &|m| eprintln!("  db:      {m}"));
         }
-        progress.stop();
+        if batch_row.is_some() {
+            phase_row.finish("failed");
+        }
+        if let Some(p) = single {
+            p.stop();
+        }
         eprintln!("dcw: error: could not add worktree for {branch}");
         return 1;
     }
@@ -407,16 +521,20 @@ pub fn create(cfg: &Config, branch: Option<String>) -> i32 {
     // information the bar cannot show (a fallback to dump/restore, a skipped clone).
     for line in &db_lines {
         if line.contains("warning") || line.contains("failed") || line.contains("skipped") {
-            eprintln!("{line}");
+            phase_row.warn(line.trim());
         }
     }
 
     // .env first (the worktree's own copy), then the private files and the per-worktree
     // .env/.db.json values. All of it is reported as a few summary rows, not one per path.
-    let config_row = progress.task("config", "");
+    // A batch row is named after the worktree, so it needs the phase; a single run's row
+    // is already labelled `config`.
+    if batch_row.is_some() {
+        phase_row.step("configuring");
+    }
     for name in ["hmx/.env", ".env"] {
         let src = cfg.repo.join(name);
-        let dst = cfg.dir_for(&branch).join(name);
+        let dst = cfg.dir_for(branch).join(name);
         if src.is_file() && !dst.exists() {
             if let Some(parent) = dst.parent() {
                 let _ = std::fs::create_dir_all(parent);
@@ -427,32 +545,52 @@ pub fn create(cfg: &Config, branch: Option<String>) -> i32 {
 
     // Side effects only: the paths and the .env/.db.json values are written, but the
     // checklist above is the whole output of `dcw new`, so they print nothing.
-    let _ = db::copy_private_paths(cfg, &branch);
-    let _ = db::set_worktree_env(cfg, &branch);
-    config_row.done();
-    progress.stop();
+    let _ = db::copy_private_paths(cfg, branch);
+    let _ = db::set_worktree_env(cfg, branch);
 
-    let port = match port_alloc(cfg, &branch) {
+    let port = match port_alloc(cfg, branch) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("error: {e}");
+            if batch_row.is_some() {
+                phase_row.finish("failed");
+            }
+            if let Some(p) = single {
+                p.stop();
+            }
             return 1;
         }
     };
     let target = Target {
-        name: branch.clone(),
+        name: branch.to_string(),
         dir: wt,
-        branch: Some(branch.clone()),
+        branch: Some(branch.to_string()),
     };
-    let code = bring_up(cfg, &target, port, false, true);
-    if code == 0 {
-        // Let the installed `dcw` shell function cd the CALLING shell into the new
-        // worktree. A child process cannot cd its parent, so the path goes through
-        // DCW_CD_FILE for the wrapper to read (the wrapper cds into <dir>/hmx when
-        // it exists, else the worktree root).
-        write_cd_file(&target.dir);
+    match batch_row {
+        // One row per worktree: it stays live until that worktree is up.
+        Some(_) => {
+            phase_row.step(&format!("starting on port {port}"));
+            let code = bring_up(cfg, &target, port, false, true);
+            phase_row.finish(if code == 0 { "up" } else { "failed" });
+            code
+        }
+        // Single target: the checklist ends here, and bring_up prints the preview URL.
+        None => {
+            phase_row.done();
+            if let Some(p) = single {
+                p.stop();
+            }
+            let code = bring_up(cfg, &target, port, false, true);
+            if code == 0 {
+                // Let the installed `dcw` shell function cd the CALLING shell into the new
+                // worktree. A child process cannot cd its parent, so the path goes through
+                // DCW_CD_FILE for the wrapper to read. Only for a single target: with
+                // several, there is no one directory to cd into.
+                write_cd_file(&target.dir);
+            }
+            code
+        }
     }
-    code
 }
 
 /// Hand the caller's shell function a directory to cd into (read by the installed

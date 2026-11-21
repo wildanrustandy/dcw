@@ -117,13 +117,26 @@ impl TaskHandle {
             .unwrap_or_default()
     }
 
-    /// Say what this row is doing right now. Without a draw block (stderr is not a
-    /// terminal) this prints a plain line, so piped runs still report every step.
+    /// Say what this row is doing right now, replacing whatever it said before.
+    /// Drops any bar: once the phase moves on (a percentage only ever describes the
+    /// checkout), a frozen bar would hide the note. Without a draw block (stderr is not
+    /// a terminal) this prints a plain line, so piped runs still report every step.
     pub fn step(&self, note: &str) {
         if self.shared.tty {
-            self.shared.update(self.idx, |t| t.note = note.to_string());
+            self.shared.update(self.idx, |t| {
+                t.note = note.to_string();
+                t.percent = None;
+            });
         } else {
             println!("  {}  {note}", self.label());
+        }
+    }
+
+    /// Same as `step`, but keeps an existing note instead of replacing it (used for
+    /// details like "warning: ..." that should not hide the phase in progress).
+    pub fn warn(&self, note: &str) {
+        if !self.shared.tty {
+            eprintln!("  {}  {note}", self.label());
         }
     }
 
@@ -154,14 +167,17 @@ impl TaskHandle {
     /// Update the bar from `done` of `total` files written. Returns false once the tree
     /// is fully on disk, so a sampler can stop; true when the total is unknown (keep
     /// sampling to the end).
+    /// Update the bar from `written` of `total` files. Returns false when there is
+    /// nothing left to observe (the count reached 100%, or the total is unknown), so a
+    /// sampler can stop. A caller that knows when the work itself finished should drive
+    /// its loop from that instead: the count can stall below 100% because git need not
+    /// write exactly the files `ls-tree` lists.
     pub fn set_written(&self, written: u64, total: u64) -> bool {
-        match percent_written(written, total) {
-            Some(p) => {
-                self.shared.update(self.idx, |t| t.percent = Some(p));
-                p < 100
-            }
-            None => true,
-        }
+        let Some(p) = percent_written(written, total) else {
+            return false;
+        };
+        self.shared.update(self.idx, |t| t.percent = Some(p));
+        p < 100
     }
 }
 
@@ -356,6 +372,21 @@ mod tests {
         assert!(tasks[a.idx].percent.is_none() && !tasks[a.idx].done);
         assert_eq!((tasks[b.idx].percent, tasks[b.idx].done), (Some(50), true));
         drop(tasks);
+        p.stop();
+    }
+
+    // set_written drives the checkout bar. It must report "nothing left" when the count
+    // reaches the total, or when the total is unknown — a sampler driven by it would
+    // otherwise poll forever. (A count that stalls below the total is the caller's job:
+    // `dcw new` stops on the checkout finishing, not on the percentage.)
+    #[test]
+    fn set_written_stops_when_there_is_nothing_left_to_measure() {
+        let p = Progress::start();
+        let row = p.task("checkout", "");
+        assert!(row.set_written(0, 100), "start of the tree is still progress");
+        assert!(row.set_written(98, 100), "a stalled count is still worth polling");
+        assert!(!row.set_written(100, 100), "complete must stop the sampler");
+        assert!(!row.set_written(1, 0), "an unknown total must stop the sampler");
         p.stop();
     }
 
