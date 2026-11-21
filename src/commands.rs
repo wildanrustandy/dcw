@@ -342,9 +342,8 @@ pub fn create(cfg: &Config, branch: Option<String>) -> i32 {
     }
 
     // fetch so a new branch starts at the latest remote commit
-    let spin = crate::progress::Spinner::start(&format!("fetch origin/{}", cfg.base));
+    let progress = crate::progress::Progress::start(&format!("fetch origin/{}", cfg.base));
     let (ok, msg) = git::fetch_origin(&cfg.repo, &cfg.base);
-    spin.stop();
     if !ok {
         eprintln!("dcw: warning: git fetch origin failed; using existing local refs");
     } else if !msg.trim().is_empty() {
@@ -355,26 +354,43 @@ pub fn create(cfg: &Config, branch: Option<String>) -> i32 {
 
     // The DB clone only reads $REPO and the branch name, so it runs alongside the
     // checkout (which is the other slow half of `dcw new`) instead of after it.
-    // `None` means the start point is missing; the `bool`, the checkout result.
-    let spin = crate::progress::Spinner::start("creating worktree + cloning DB");
-    let db_lines = std::thread::scope(|s| {
+    // The DB clone and the checkout both run on their own threads while a sampler turns
+    // "files written / files in the tree" into the bar's percentage — both measured,
+    // nothing estimated.
+    // `None` = the start point is missing; the `bool` = the checkout result.
+    let outcome = std::thread::scope(|s| {
         let db = s.spawn(|| db::db_clone(cfg, &branch));
         // start-point order: existing local branch → origin/<base> → local <base>
-        let added = if git::ref_exists(&cfg.repo, &format!("refs/heads/{branch}")) {
-            git::worktree_add_existing(&cfg.repo, &wt, &branch)
+        let (start, rev) = if git::ref_exists(&cfg.repo, &format!("refs/heads/{branch}")) {
+            (None, branch.clone())
         } else if git::ref_exists(&cfg.repo, &format!("refs/remotes/origin/{}", cfg.base)) {
-            git::worktree_add_new(&cfg.repo, &wt, &branch, &format!("origin/{}", cfg.base))
+            (Some(format!("origin/{}", cfg.base)), format!("origin/{}", cfg.base))
         } else if git::ref_exists(&cfg.repo, &format!("refs/heads/{}", cfg.base)) {
-            git::worktree_add_new(&cfg.repo, &wt, &branch, &cfg.base)
+            (Some(cfg.base.clone()), cfg.base.clone())
         } else {
-            // Printed after the spinner stops, so the two do not share a line.
-            return None;
+            let (d, c) = db.join().unwrap_or_default();
+            return (d, c, None);
         };
-        let (db, created) = db.join().unwrap_or_default();
-        Some((db, created, added))
+        let total = crate::progress::checkout_file_count(&cfg.repo, &rev);
+        let (wt_for_sampler, progress_ref) = (wt.clone(), &progress);
+        let sampler = s.spawn(move || {
+            while progress_ref
+                .set_written(crate::progress::files_written(&wt_for_sampler), total)
+            {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
+        });
+        let added = match start {
+            Some(start) => git::worktree_add_new(&cfg.repo, &wt, &branch, &start),
+            None => git::worktree_add_existing(&cfg.repo, &wt, &branch),
+        };
+        let _ = sampler.join();
+        let (d, c) = db.join().unwrap_or_default();
+        (d, c, Some(added))
     });
-    spin.stop();
-    let Some((db_lines, db_created, added)) = db_lines else {
+    progress.stop();
+    let (db_lines, db_created, added) = outcome;
+    let Some(added) = added else {
         eprintln!("dcw: error: neither origin/{} nor local {} exists in {}.", cfg.base, cfg.base, cfg.repo.display());
         eprintln!("       fetch the base branch, or set DEV_CAPTAIN_BASE=<branch>.");
         return 2;
