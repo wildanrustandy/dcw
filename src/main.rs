@@ -1,6 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 
 mod celery;
+mod changelog;
 mod commands;
 mod config;
 mod db;
@@ -62,6 +63,11 @@ enum Commands {
     Celery(CeleryCmd),
     /// Download the latest prebuilt release and replace the running binary
     Update,
+    /// Print release notes (all of them, or only those newer than a version)
+    Changelog {
+        /// show only releases newer than this one (e.g. the version you are running)
+        since: Option<String>,
+    },
     /// Re-initialize: show current config, ask to reconfigure, then install (like dcw install.sh)
     #[command(alias = "setup")]
     Init(InitArgs),
@@ -154,6 +160,7 @@ fn main() {
             }
         },
         Commands::Update => update(&cfg),
+        Commands::Changelog { since } => changelog_cmd(since),
         Commands::Uninstall => setup::uninstall(),
         Commands::Init(args) => setup::run(setup::InitArgs {
             yes: args.yes,
@@ -165,6 +172,41 @@ fn main() {
         }),
     };
     std::process::exit(code);
+}
+
+/// `dcw changelog [version]`: all notes, or only those newer than `version`. The latter is
+/// what `dcw update` runs on the freshly installed binary, so a jump across several
+/// releases shows each of them.
+fn changelog_cmd(since: Option<String>) -> i32 {
+    let Some(from) = since else {
+        return match changelog::latest() {
+            Some((version, body)) => {
+                println!("{version}\n\n{body}");
+                0
+            }
+            None => {
+                eprintln!("dcw changelog: this build has no release notes");
+                1
+            }
+        };
+    };
+    let from = changelog::parse_version(&from).unwrap_or(from);
+    match changelog::since(&from) {
+        // Empty output (not a message) so `dcw update` can tell "no range to show" from
+        // "nothing changed" and fall back to the newest entry.
+        Some(notes) if notes.is_empty() => {
+            eprintln!("dcw: no releases newer than {from}.");
+            0
+        }
+        Some(notes) => {
+            println!("{notes}");
+            0
+        }
+        None => {
+            eprintln!("dcw changelog: {from} is not a version in the changelog (typo?)");
+            1
+        }
+    }
 }
 
 /// Self-update for a curl-installed binary: download the latest prebuilt release for
@@ -230,12 +272,45 @@ fn update(_cfg: &config::Config) -> i32 {
         return 1;
     }
 
-    if new_version.is_empty() {
-        println!("dcw updated.");
-    } else {
-        println!("dcw updated ({new_version}).");
+    match new_version.is_empty() {
+        true => println!("dcw updated."),
+        false => println!("dcw updated ({new_version})."),
     }
+    print_release_notes(&exe, &new_version);
     0
+}
+
+/// Show what changed, by asking the NEW binary for its own notes: this process's embedded
+/// changelog predates the release it just installed, so it cannot describe it. Best effort
+/// — a binary that cannot answer (a platform quirk, a missing subcommand) must not turn a
+/// successful update into a failure.
+fn print_release_notes(exe: &std::path::Path, new_version: &str) {
+    // Re-running `dcw update` on the latest release has nothing to report.
+    let current = env!("CARGO_PKG_VERSION");
+    if changelog::parse_version(new_version).as_deref() == Some(current) {
+        return;
+    }
+    let ask = |since: Option<&str>| -> String {
+        let mut cmd = std::process::Command::new(exe);
+        cmd.arg("changelog");
+        if let Some(s) = since {
+            cmd.arg(s);
+        }
+        match cmd.output() {
+            Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            _ => String::new(),
+        }
+    };
+    // Everything between the version that ran and the one just installed. Falling back to
+    // the newest entry covers a version the changelog does not know (older than its oldest
+    // entry), where there is no range to describe.
+    let mut notes = ask(Some(current));
+    if notes.is_empty() {
+        notes = ask(None);
+    }
+    if !notes.is_empty() {
+        println!("\nWhat's new:\n\n{notes}");
+    }
 }
 
 /// Resolve the download URL for this platform's prebuilt binary. Asset names are
