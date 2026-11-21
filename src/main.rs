@@ -126,22 +126,22 @@ fn main() {
         Commands::Celery(c) => match c {
             CeleryCmd::Start { worktree } => {
                 let b = resolve_key(&cfg, worktree);
-                match celery::celery_start(&cfg, &b, true) {
+                match celery::celery_start(&cfg, &b, true, false) {
                     Ok(_) => 0,
                     Err(()) => 1,
                 }
             }
             CeleryCmd::Restart { worktree } => {
                 let b = resolve_key(&cfg, worktree);
-                celery::celery_stop(&cfg, &b, 2);
-                match celery::celery_start(&cfg, &b, true) {
+                celery::celery_stop_print(&cfg, &b, 2);
+                match celery::celery_start(&cfg, &b, true, false) {
                     Ok(_) => 0,
                     Err(()) => 1,
                 }
             }
             CeleryCmd::Stop { worktree } => {
                 let b = resolve_key(&cfg, worktree);
-                celery::celery_stop(&cfg, &b, 2);
+                celery::celery_stop_print(&cfg, &b, 2);
                 0
             }
             CeleryCmd::Status => {

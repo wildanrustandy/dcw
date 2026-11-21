@@ -446,14 +446,30 @@ pub fn abort_pick(cfg: &Config) -> i32 {
         return 1;
     }
     println!();
-    for name in picked {
-        let Some(t) = commands::find_target(cfg, &name) else {
-            eprintln!("dcw: {name} disappeared — skipped");
-            continue;
-        };
-        let port = commands::port_for(cfg, &t);
-        commands::abort_one(cfg, &t.name, &t.dir, port);
-    }
+    let resolved: Vec<(String, std::path::PathBuf, Option<u16>)> = picked
+        .iter()
+        .filter_map(|name| {
+            let Some(t) = commands::find_target(cfg, name) else {
+                eprintln!("dcw: {name} disappeared — skipped");
+                return None;
+            };
+            let port = commands::port_for(cfg, &t);
+            Some((t.name, t.dir.clone(), port))
+        })
+        .collect();
+
+    // One row per worktree, aborted at the same time: each target's slow step is
+    // `dropdb`, and nothing in an abort depends on another target. Output goes through
+    // each target's own row, so the interleaved plain prints of a sequential loop are
+    // gone. A single target still gets its own block (with one row).
+    let progress = crate::progress::Progress::start();
+    let rows: Vec<_> = resolved.iter().map(|(name, _, _)| progress.task(name, "")).collect();
+    std::thread::scope(|s| {
+        for ((name, dir, port), row) in resolved.iter().zip(&rows) {
+            s.spawn(move || commands::abort_one(cfg, name, dir, *port, row));
+        }
+    });
+    progress.stop();
     0
 }
 
