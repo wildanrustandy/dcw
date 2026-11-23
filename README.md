@@ -138,6 +138,9 @@ Worktree, DB clone, dan state `~/.dev-captain/` **tidak** disentuh.
 ## Catatan
 
 - State: `~/.dev-captain/` (port registry, log, pidfile) + `<repo>/.worktrees/<branch>`.
+- Port dipakai ulang: `dcw new` membuang entry registry yang worktree-nya sudah tidak ada
+  (dan tidak punya proses hidup), jadi menghapus worktree tanpa `dcw abort` tidak
+  "membakar" nomor port. Worktree yang di-`dcw stop` tetap memegang port-nya.
 - `dcw abort` hapus DB branch **permanen** (ada konfirmasi); DB `hmxmain` tak pernah disentuh.
 - macOS/Linux only. Butuh `git`, `lsof`, `curl`/`wget`, dan (untuk `new`/`abort`)
   `psql`/`createdb`/`pg_dump`/`dropdb` di PATH.

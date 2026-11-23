@@ -169,6 +169,13 @@ fn port_free(cfg: &Config, key: &str) {
     registry::save(&cfg.reg_file, &out);
 }
 
+/// Is this registry entry a leftover whose worktree no longer exists? `port_free` only
+/// runs from `dcw abort`, so a worktree removed any other way keeps its port reserved
+/// forever and every later `new` starts one number higher.
+fn is_orphan(info: &registry::PortInfo, base: &str, live: &std::collections::HashSet<String>) -> bool {
+    info.branch != base && !live.contains(&info.branch) && !process::pid_alive(info.pid)
+}
+
 /// Allocate the first free port in [PORT_BASE+1, PORT_MAX-1] for a branch, claiming it.
 fn port_alloc(cfg: &Config, branch: &str) -> Result<u16, String> {
     let _lock = Lock::acquire(cfg.lock_dir.clone());
@@ -176,6 +183,16 @@ fn port_alloc(cfg: &Config, branch: &str) -> Result<u16, String> {
         return Ok(p);
     }
     let mut reg = registry::load(&cfg.reg_file);
+    // Reclaim ports of worktrees that are gone from `git worktree list`.
+    let live: std::collections::HashSet<String> = git::list_worktrees(&cfg.repo)
+        .iter()
+        .map(|wt| worktree_name(cfg, wt))
+        .collect();
+    let before = reg.len();
+    reg.retain(|_, info| !is_orphan(info, &cfg.base, &live));
+    if reg.len() != before {
+        registry::save(&cfg.reg_file, &reg);
+    }
     for p in (cfg.port_base + 1)..cfg.port_max {
         let key = p.to_string();
         if reg.contains_key(&key) {
@@ -1088,5 +1105,27 @@ fn tail_follow(path: &Path) {
         }
         pos = reader.stream_position().unwrap_or(pos);
         std::thread::sleep(std::time::Duration::from_millis(300));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn info(branch: &str, pid: i32) -> registry::PortInfo {
+        registry::PortInfo { branch: branch.into(), pid, started_at: None }
+    }
+
+    #[test]
+    fn orphan_is_a_dead_worktree_that_is_not_base() {
+        let live: std::collections::HashSet<String> = ["PRD_INV_1".to_string()].into();
+        // dead worktree, no live pid: reclaimed
+        assert!(is_orphan(&info("fix", 0), "Inventory", &live));
+        // worktree still exists (even if its server is down): kept
+        assert!(!is_orphan(&info("PRD_INV_1", 0), "Inventory", &live));
+        // server still alive: kept even if git does not list it
+        assert!(!is_orphan(&info("stray", std::process::id() as i32), "Inventory", &live));
+        // the base branch lives in $REPO, never in the worktree list: kept
+        assert!(!is_orphan(&info("Inventory", 0), "Inventory", &live));
     }
 }
