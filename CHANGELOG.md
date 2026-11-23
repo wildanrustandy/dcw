@@ -6,6 +6,17 @@ catatan rilis di GitHub dan ditampilkan oleh `dcw update` setelah binary diganti
 
 Rilis pertama yang tersedia untuk umum adalah **0.1.0**; tidak ada tag 0.2.1 dan 0.2.3.
 
+## 0.2.11 — 2026-11-23
+
+### Fixed
+
+- `dcw new` kini memakai kembali port milik worktree yang sudah tidak ada. Sebelumnya
+  registry hanya dibersihkan oleh `dcw abort`, jadi worktree yang dihapus dengan cara lain
+  (`git worktree remove`, `rm -rf`) meninggalkan port-nya terkunci selamanya dan setiap
+  `dcw new` berikutnya mulai satu nomor lebih tinggi — tanpa terlihat di `dcw list`.
+  Entry yang dibuang hanya yang worktree-nya tidak ada di `git worktree list` **dan**
+  tidak punya proses hidup; base branch dan worktree yang di-`stop` tetap memegang port-nya.
+
 ## 0.2.10 — 2026-11-21
 
 ### Added
