@@ -21,7 +21,6 @@ pub struct Config {
     pub celery_concurrency: u32,
     pub celery_loglevel: String,
     // derived
-    #[allow(dead_code)]
     pub config_file: PathBuf,
     #[allow(dead_code)]
     pub state_dir: PathBuf,
@@ -52,6 +51,30 @@ pub fn read_config(path: &Path) -> HashMap<String, String> {
         }
     }
     map
+}
+
+/// Set one KEY in a dcw config file in place: replace the line that assigns `key`
+/// (in either accepted form) or append when absent. Every other line — comments and
+/// hand-edited keys included — is kept untouched, unlike `dcw init`'s full rewrite.
+pub fn set_config_value(path: &Path, key: &str, value: &str) -> std::io::Result<()> {
+    let line_for = format!(": \"${{{key}:={value}}}\"");
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let mut replaced = false;
+    let mut out = String::with_capacity(text.len() + line_for.len() + 1);
+    for line in text.lines() {
+        if !replaced && parse_assignment(line).is_some_and(|(k, _)| k == key) {
+            out.push_str(&line_for);
+            replaced = true;
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    if !replaced {
+        out.push_str(&line_for);
+        out.push('\n');
+    }
+    std::fs::write(path, out)
 }
 
 /// Parse one config line in either form used by dcw/dcw:
@@ -318,5 +341,35 @@ impl Config {
     /// slug for file names: '/' → '_' (dcw `_slug`).
     pub fn slug(&self, branch: &str) -> String {
         branch.replace('/', "_")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_config_value_touches_only_its_own_line() {
+        let dir = std::env::temp_dir().join(format!("dcw-test-setcfg-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let p = dir.join("config");
+        std::fs::write(&p, "# comment\n: \"${PORT_BASE:=4200}\"\nDCW_CELERY=0\n").unwrap();
+
+        // replace, in plain KEY=VALUE form, keeping neighbors and comments
+        set_config_value(&p, "DCW_CELERY", "1").unwrap();
+        let got = std::fs::read_to_string(&p).unwrap();
+        assert!(got.contains("# comment"), "{got}");
+        assert!(got.contains("PORT_BASE:=4200"), "{got}");
+        assert!(got.contains("DCW_CELERY:=1"), "{got}");
+
+        // replace in shell form + append when missing
+        set_config_value(&p, "DCW_CELERY", "0").unwrap();
+        set_config_value(&p, "DCW_DOMAIN", "dev.local").unwrap();
+        let map = read_config(&p);
+        assert_eq!(map.get("DCW_CELERY").unwrap(), "0");
+        assert_eq!(map.get("DCW_DOMAIN").unwrap(), "dev.local");
+        assert_eq!(map.get("PORT_BASE").unwrap(), "4200");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

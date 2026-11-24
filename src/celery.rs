@@ -52,7 +52,9 @@ fn celery_ready(cfg: &Config, branch: &str) -> bool {
 /// requested worker did not come up.
 pub fn celery_start(cfg: &Config, branch: &str, wait: bool, quiet: bool) -> Result<i32, ()> {
     if !cfg.celery_enabled {
-        println!("  celery    skipped (DCW_CELERY=0)");
+        if !quiet {
+            println!("  celery    skipped (DCW_CELERY=0)");
+        }
         return Err(());
     }
     if let Some(pid) = celery_pid(cfg, branch) {
