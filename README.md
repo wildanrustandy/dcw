@@ -38,6 +38,7 @@ dcw celery <cmd>        kelola worker (start|restart|stop|status)
 dcw update              unduh binary rilis terbaru, ganti binary terpasang, tampilkan changelog
 dcw changelog [versi]   tampilkan catatan rilis (semua, atau yang lebih baru dari <versi>)
 dcw init                lihat config / set up ulang
+dcw config              ubah pengaturan — toggle worker Celery bawaan (interaktif)
 dcw uninstall           hapus dcw dari mesin
 ```
 
@@ -90,7 +91,7 @@ Precedence: **env per-call** > `~/.config/dcw/config` > default.
 | `DEV_CAPTAIN_BASE` | `origin/HEAD` | base branch |
 | `PORT_BASE` / `PORT_MAX` | `5200` / `5220` | range port |
 | `DCW_DOMAIN` | auto | domain preview (kosong = `http://127.0.0.1:<port>`) |
-| `DCW_CELERY` | `1` | `0` = tanpa worker |
+| `DCW_CELERY` | `1` | `0` = tanpa worker (termasuk `dcw celery start`); ditulis & dipertahankan oleh `dcw init` |
 | `DCW_CELERY_CONCURRENCY` | `2` | jumlah child worker Celery |
 | `DCW_CELERY_QUEUES` | 9 queue | queue yang di-consume worker |
 | `DCW_CELERY_LOGLEVEL` | `INFO` | level log worker |

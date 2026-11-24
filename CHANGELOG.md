@@ -6,6 +6,26 @@ catatan rilis di GitHub dan ditampilkan oleh `dcw update` setelah binary diganti
 
 Rilis pertama yang tersedia untuk umum adalah **0.1.0**; tidak ada tag 0.2.1 dan 0.2.3.
 
+## 0.2.12 — 2026-11-24
+
+### Added
+
+- Subcommand baru `dcw config`: menampilkan config efektif lalu menanyakan apakah worker
+  Celery dijalankan secara default (`dcw new`/`dcw start`). Jawaban diedit **in-place** di
+  `~/.config/dcw/config` — hanya baris `DCW_CELERY` yang berubah, key lain yang kamu tulis
+  manual di file tidak tergeser (tidak seperti rewrite penuh oleh `dcw init`).
+- `dcw init` kini menulis `DCW_CELERY` ke file config — nilai yang sudah ada dipertahankan
+  (default `1`) — dan menampilkannya sebagai baris `celery:` di blok "Current configuration".
+  Opsi mematikan worker bawaan (`DCW_CELERY=0`) jadi terlihat dan bisa diedit langsung di
+  `~/.config/dcw/config`; sebelumnya key ini harus ditulis manual dan hilang setiap kali
+  `dcw init` dijalankan ulang.
+
+### Changed
+
+- Saat `DCW_CELERY=0`, `dcw new` tidak lagi mencetak baris "celery skipped" di tengah
+  progress block (baris rutin memang diringkas saat block aktif); `dcw start`, `dcw restart`,
+  dan `dcw celery start` tetap mencetak alasan tersebut.
+
 ## 0.2.11 — 2026-11-23
 
 ### Fixed

@@ -68,6 +68,8 @@ enum Commands {
         /// show only releases newer than this one (e.g. the version you are running)
         since: Option<String>,
     },
+    /// Show the effective config and change settings interactively (Celery autostart)
+    Config,
     /// Re-initialize: show current config, ask to reconfigure, then install (like dcw install.sh)
     #[command(alias = "setup")]
     Init(InitArgs),
@@ -162,6 +164,10 @@ fn main() {
         Commands::Update => update(&cfg),
         Commands::Changelog { since } => changelog_cmd(since),
         Commands::Uninstall => setup::uninstall(),
+        Commands::Config => {
+            setup::config_menu();
+            0
+        }
         Commands::Init(args) => setup::run(setup::InitArgs {
             yes: args.yes,
             repo: args.repo,

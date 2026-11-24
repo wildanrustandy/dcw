@@ -99,6 +99,57 @@ fn confirm(prompt: &str) -> bool {
     line.trim().to_lowercase().starts_with('y')
 }
 
+/// Ask a yes/no question honoring `default` when the answer is empty.
+fn ask_bool(prompt: &str, default: bool) -> bool {
+    let mut out = std::io::stdout();
+    let hint = if default { "[Y/n]" } else { "[y/N]" };
+    write!(out, "{prompt} {hint}: ").ok();
+    out.flush().ok();
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return default;
+    }
+    let t = line.trim().to_lowercase();
+    if t.is_empty() {
+        default
+    } else {
+        t.starts_with('y')
+    }
+}
+
+/// `dcw config`: show the effective config, then toggle settings. Edits only the
+/// line it changes in the config file, so other keys survive untouched.
+pub fn config_menu() -> i32 {
+    let cfg = crate::config::Config::load();
+    print_current_config();
+    if !(std::io::stdin().is_terminal() && std::io::stdout().is_terminal()) {
+        println!("(run `dcw config` in a terminal to change settings)");
+        return 0;
+    }
+    let next = ask_bool(
+        "Start the Celery worker by default (dcw new/start)?",
+        cfg.celery_enabled,
+    );
+    if next == cfg.celery_enabled {
+        println!("no changes made");
+        return 0;
+    }
+    let value = if next { "1" } else { "0" };
+    if let Err(e) = crate::config::set_config_value(&cfg.config_file, "DCW_CELERY", value) {
+        eprintln!("✗ error: could not write {}: {e}", cfg.config_file.display());
+        return 1;
+    }
+    println!(
+        "✓ celery worker by default: {}",
+        if next { "on" } else { "off" }
+    );
+    // An exported DCW_CELERY would silently override the file just written.
+    if std::env::var("DCW_CELERY").is_ok() {
+        println!("note: DCW_CELERY is also set in the environment and takes precedence over the file");
+    }
+    0
+}
+
 /// Print the effective configuration (what dcw will actually use right now).
 fn print_current_config() {
     let cfg = crate::config::Config::load();
@@ -109,6 +160,10 @@ fn print_current_config() {
     println!("  base:       {}", cfg.base);
     println!("  ports:      {}-{}", cfg.port_base, cfg.port_max);
     println!("  domain:     {domain}");
+    println!(
+        "  celery:     {} (DCW_CELERY=1|0)",
+        if cfg.celery_enabled { "on" } else { "off" }
+    );
     println!();
 }
 
@@ -154,6 +209,14 @@ pub fn run(args: InitArgs) -> i32 {
         .get("PORT_MAX")
         .and_then(|s| s.parse().ok())
         .unwrap_or(4215);
+    // Preserved so re-running init does not silently re-enable the worker; anything
+    // parse_bool would reject (config.rs) falls back to 1, like the port keys.
+    // shortcut: only DCW_CELERY survives re-init, other hand-edited keys are dropped when init rewrites the file
+    let def_celery = existing
+        .get("DCW_CELERY")
+        .filter(|v| matches!(v.as_str(), "1" | "true" | "yes" | "0" | "false" | "no"))
+        .cloned()
+        .unwrap_or_else(|| "1".into());
 
     let repo = match args.repo {
         Some(r) => r,
@@ -200,7 +263,8 @@ pub fn run(args: InitArgs) -> i32 {
          : \"${{DEV_CAPTAIN_REPO:={repo}}}\"\n\
          : \"${{DEV_CAPTAIN_VENV:={venv}}}\"\n\
          : \"${{PORT_BASE:={port_base}}}\"\n\
-         : \"${{PORT_MAX:={port_max}}}\"\n"
+         : \"${{PORT_MAX:={port_max}}}\"\n\
+         : \"${{DCW_CELERY:={def_celery}}}\"\n"
     );
     if std::fs::write(config_path(), &content).is_err() {
         eprintln!("✗ error: could not write {}", config_path().display());
