@@ -975,7 +975,7 @@ fn relative_through_symlinks(dir: &Path, base: &Path) -> std::io::Result<PathBuf
 }
 
 /// Render a Unicode box-drawing table (ASCII fallback, like dcw's `box()`).
-fn render_box(headers: &[&str], rows: &[Vec<String>]) {
+pub fn render_box(headers: &[&str], rows: &[Vec<String>]) {
     let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {

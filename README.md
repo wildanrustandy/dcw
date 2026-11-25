@@ -32,6 +32,7 @@ dcw stop [worktree]     stop server+worker (worktree & DB tetap)
 dcw restart [worktree]  stop lalu start server+worker (worktree & DB tetap)
 dcw jump                pilih worktree → cd ke folder hmx-nya
 dcw list                daftar worktree + status (up/dead) + URL
+dcw ram                 pemakaian RAM user saat ini: per worktree (server+worker) + proses lain
 dcw abort [worktree]    hapus worktree + stop + DROP DB (konfirmasi)
 dcw logs [worktree]     tail log server atau worker
 dcw celery <cmd>        kelola worker (start|restart|stop|status)
@@ -59,6 +60,15 @@ dapat satu baris progress sendiri. Batas 3 bukan soal sopan-santun: checkout dan
 menambah sedikit kecepatan, sementara tiap worktree hidup memakan ~1.6 GB RAM dan ~1.4 GB
 disk. Karena tidak ada satu direktori tujuan, `cd` otomatis hanya dilakukan bila namanya
 satu.
+
+**Pemakaian RAM.** `dcw ram` menjumlahkan RSS semua proses user saat ini. Proses yang
+dikelola dcw tampil per worktree (kolom server dan worker — anak autoreload dan child
+Celery ikut terhitung karena dijumlahkan per process group), sisanya dikelompokkan per
+nama command — untuk runtime generik seperti `node`/`python`, label-nya nama skrip yang
+dijalankan — ditutup baris total dcw dan total user. Penjumlahan RSS menghitung ganda
+memori yang dipakai bersama antar proses, jadi angkanya indikatif — untuk tahu worktree
+mana yang berat, bukan akuntansi byte-exact. Base branch muncul dengan nama branch-nya
+(bukan label `(repo)`).
 
 **Identitas = nama worktree, bukan nama branch.** `dcw start`/`stop`/`restart`/`abort`/
 `logs` menerima nama direktori worktree (mis. `PRD_INV_00296`), karena satu worktree bisa

@@ -9,6 +9,7 @@ mod git;
 mod picker;
 mod process;
 mod progress;
+mod ram;
 mod registry;
 mod setup;
 
@@ -44,6 +45,8 @@ enum Commands {
     },
     /// List all git worktrees with their running/dead state, port, pid, and URL
     List,
+    /// Show the current user's RAM: per worktree (server + worker), other processes, totals
+    Ram,
     /// Pick a worktree with the arrow keys and print its path (shell function cds there)
     Jump,
     /// Destroy worktree + server + worker + DB (confirmation)
@@ -121,6 +124,15 @@ fn resolve_key(cfg: &config::Config, arg: Option<String>) -> String {
 }
 
 fn main() {
+    // `dcw ram | head` must end silently like any Unix tool. Rust ignores SIGPIPE by
+    // default, so the write after the pipe closes panics instead of killing us.
+    // Safety: runs once at startup, before any threads exist.
+    let _ = unsafe {
+        nix::sys::signal::signal(
+            nix::sys::signal::Signal::SIGPIPE,
+            nix::sys::signal::SigHandler::SigDfl,
+        )
+    };
     let cli = Cli::parse();
     let cfg = config::Config::load();
     let code = match cli.command {
@@ -130,6 +142,10 @@ fn main() {
         Commands::Restart { worktree } => commands::restart(&cfg, worktree),
         Commands::List => {
             commands::list(&cfg);
+            0
+        }
+        Commands::Ram => {
+            ram::ram(&cfg);
             0
         }
         Commands::Jump => commands::jump(&cfg),
