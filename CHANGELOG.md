@@ -6,6 +6,24 @@ catatan rilis di GitHub dan ditampilkan oleh `dcw update` setelah binary diganti
 
 Rilis pertama yang tersedia untuk umum adalah **0.1.0**; tidak ada tag 0.2.1 dan 0.2.3.
 
+## 0.2.13 — 2026-11-25
+
+### Added
+
+- Subcommand baru `dcw ram`: pemakaian RAM user saat ini, dirinci per worktree dcw
+  (kolom server dan worker — anak autoreload dan child Celery ikut terhitung karena
+  dijumlahkan per process group, mengandalkan PGID == PID dari proses dcw), lalu proses
+  lain yang bukan milik dcw dikelompokkan per nama command, ditutup total dcw dan total
+  user. Penjumlahan RSS menghitung ganda memori shared antar proses, jadi angkanya
+  indikatif, bukan byte-exact. Proses di luar dcw dilabeli nama command; untuk runtime
+  generik (`node`, `python`) label-nya nama skrip pertama yang dijalankan.
+
+### Fixed
+
+- Semua subcommand yang di-pipe ke program yang menutup pipe lebih dulu (mis.
+  `dcw ram | head`) kini berakhir senyap seperti tool Unix pada umumnya; sebelumnya
+  dcw panic `failed printing to stdout: Broken pipe`.
+
 ## 0.2.12 — 2026-11-24
 
 ### Added
