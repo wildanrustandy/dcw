@@ -1,7 +1,10 @@
 // picker.rs — arrow-key target menus for new/stop/abort/logs with no branch.
 //
-// stop and abort share ONE candidate set: the dcw-managed worktrees (children of
-// $WT_DIR), each annotated with its port and up/down state. Multi-select with Space,
+// Every target menu starts from ONE candidate set — the dcw-managed worktrees (children
+// of $WT_DIR), each annotated with its port and up/down state — but each offers only
+// what its command can act on: `stop` lists the running targets, `start` the stopped
+// ones, while `restart`/`abort`/`jump` list everything. A menu whose candidates all
+// fail that filter is not drawn at all (see `state_menu_rows`). Multi-select with Space,
 // confirm with Enter. `new` is single-select (a shell can only cd into one), `logs`
 // multi-selects log files to tail together.
 
@@ -42,6 +45,12 @@ impl WtRow {
         } else {
             format!("{} → {}", self.name, self.branch)
         }
+    }
+
+    /// Is this target running? True when its recorded server pid is alive or its port
+    /// is bound — the same test that produces the "up"/"down" status column.
+    fn up(&self) -> bool {
+        self.status == "up"
     }
 }
 
@@ -237,6 +246,81 @@ fn wt_menu_row(r: &WtRow) -> Row {
     }
 }
 
+/// The base checkout as a menu row ($REPO is not a managed worktree, so it is never in
+/// `worktree_rows`; callers that should offer it insert it explicitly). Labelled
+/// `(repo)` like `dcw list`, with the base branch as the value so `find_target`
+/// resolves it through the base-branch path.
+///
+/// `branch` is left EMPTY on purpose: the column reads "name → branch when they differ",
+/// and the main checkout is named for the repo, not for a branch — `(repo) → Inventory`
+/// would suggest a worktree switched onto another branch, which is not what this is.
+fn base_row(cfg: &Config, up: bool) -> WtRow {
+    WtRow {
+        name: "(repo)".into(),
+        branch: String::new(),
+        dir: cfg.repo.clone(),
+        port: cfg.port_base.to_string(),
+        status: if up { "up" } else { "down" }.to_string(),
+    }
+}
+
+/// The targets a start/stop/restart menu offers, as WtRow: the managed worktrees plus
+/// the base checkout when `$REPO` exists. `base_up` is passed in because probing it
+/// costs an `lsof` call.
+fn all_rows(cfg: &Config, base_up: bool) -> Vec<WtRow> {
+    let mut rows = worktree_rows(cfg);
+    if cfg.repo.is_dir() {
+        rows.insert(0, base_row(cfg, base_up));
+    }
+    rows
+}
+
+/// Keep the targets `want` selects, as menu rows. Pure, so the selection rule is
+/// testable without a terminal, a repo, or a running server.
+fn menu_rows_for(rows: &[WtRow], want: impl Fn(&WtRow) -> bool) -> Vec<Row> {
+    rows.iter().filter(|r| want(r)).map(wt_menu_row).collect()
+}
+
+/// What a state-filtered menu decided to do.
+enum Menu {
+    /// Draw this menu and act on the picks.
+    Show(Vec<Row>),
+    /// Nothing to act on: the note was printed and the command should succeed.
+    Empty,
+}
+
+/// Menu rows for a state-filtered command (`start`/`stop`/`restart`): every target that
+/// `want` selects, in the shared menu shape.
+///
+/// The empty case is checked BEFORE the terminal check, and that order is the point:
+/// "there is no work" does not need a tty to know, so a scripted `dcw stop` still gets
+/// the note instead of a usage error.
+///
+/// `Err(code)` is a usage error only — targets exist to pick from but there is no
+/// terminal to pick with, which no target state can fix.
+fn state_menu_rows(
+    cfg: &Config,
+    cmd: &str,
+    want: impl Fn(&WtRow) -> bool,
+    empty_note: &str,
+) -> Result<Menu, i32> {
+    let base_up = base_running(cfg);
+    let rows = menu_rows_for(&all_rows(cfg, base_up), want);
+    // An empty selection means the command has nothing to act on (`stop` with every
+    // captain down, `start` with every one up). That is a successful no-op, but a silent
+    // one is a bad answer to "did that work?" — the user asked for a menu and got no
+    // output at all, which reads as a crash or a swallowed command. Say so, and succeed.
+    if rows.is_empty() {
+        eprintln!("{empty_note}");
+        return Ok(Menu::Empty);
+    }
+    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+        eprintln!("usage: dcw {cmd} <target>   (run it in a terminal to pick from a list)");
+        return Err(2);
+    }
+    Ok(Menu::Show(rows))
+}
+
 /// jump: pick a single worktree (up or dead) and print its directory. The base
 /// branch is included as the repo root, so `dcw jump` can also take you home.
 pub fn jump_pick(cfg: &Config) -> i32 {
@@ -302,35 +386,32 @@ fn base_running(cfg: &Config) -> bool {
     process::port_bound(cfg.port_base)
 }
 
-/// start: pick a stopped target and start it (managed worktrees and, when down, the
-/// base checkout — repo utama — which runs in $REPO itself, not a worktree).
+/// The targets `dcw start` offers: everything not currently running.
+fn startable(r: &WtRow) -> bool {
+    !r.up()
+}
+
+/// The targets `dcw stop` offers: only what is currently running.
+fn stoppable(r: &WtRow) -> bool {
+    r.up()
+}
+
+/// Said by `dcw stop` when nothing is running. The menu never appears, so this line is
+/// the only answer the user gets — it has to name the state, not just imply it.
+pub const NO_ACTIVE: &str = "no active worktrees — nothing is running";
+
+/// Said by `dcw start` when everything is already up.
+pub const NONE_STOPPED: &str = "no stopped worktrees — everything is up";
+
+/// start: pick a stopped target and start it. Only targets that are DOWN are offered
+/// (managed worktrees and the base checkout, which runs in $REPO itself). When every
+/// target is already up, say so — there is nothing to start.
 pub fn start_pick(cfg: &Config) -> i32 {
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        eprintln!("usage: dcw start <target>   (run it in a terminal to pick from a list)");
-        return 2;
-    }
-    let mut rows: Vec<Row> = worktree_rows(cfg)
-        .iter()
-        .filter(|r| r.status == "down")
-        .map(wt_menu_row)
-        .collect();
-    if cfg.repo.is_dir() && !base_running(cfg) {
-        rows.insert(
-            0,
-            Row {
-                // Same "(repo)" label `dcw list` uses; the value stays cfg.base so
-                // find_target resolves it through the base-branch path.
-                display: format!("{:<32} {:<7} {}", "(repo)", cfg.port_base, "down"),
-                value: cfg.base.clone(),
-            },
-        );
-    }
-    if rows.is_empty() {
-        eprintln!(
-            "no stopped targets — create one with 'dcw new <branch>', or check 'dcw list'"
-        );
-        return 1;
-    }
+    let rows = match state_menu_rows(cfg, "start", startable, NONE_STOPPED) {
+        Ok(Menu::Show(rows)) => rows,
+        Ok(Menu::Empty) => return 0,
+        Err(code) => return code,
+    };
     let picked = run_menu(rows, "WORKTREE  PORT  STATUS", false);
     let Some(name) = picked.into_iter().next() else {
         return 0;
@@ -338,32 +419,16 @@ pub fn start_pick(cfg: &Config) -> i32 {
     commands::start(cfg, Some(name))
 }
 
-/// stop: multi-select targets to stop (managed worktrees and the base checkout).
+/// stop: multi-select targets to stop. Only targets that are UP are offered — stopping
+/// something already down is a no-op, and dead rows only make the live ones harder to
+/// find. When nothing is running, say so — there is nothing to stop.
 pub fn stop_pick(cfg: &Config) -> i32 {
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        eprintln!("usage: dcw stop <target>   (run it in a terminal to pick from a list)");
-        return 2;
-    }
-    let mut rows = worktree_rows(cfg);
-    if cfg.repo.is_dir() {
-        let status = if base_running(cfg) { "up" } else { "down" };
-        rows.insert(
-            0,
-            WtRow {
-                name: "(repo)".into(),
-                branch: cfg.base.clone(),
-                dir: cfg.repo.clone(),
-                port: cfg.port_base.to_string(),
-                status: status.to_string(),
-            },
-        );
-    }
-    if rows.is_empty() {
-        eprintln!("no targets — nothing to stop");
-        return 1;
-    }
-    let menu: Vec<Row> = rows.iter().map(wt_menu_row).collect();
-    let picked = run_menu(menu, "WORKTREE  PORT  STATUS", true);
+    let rows = match state_menu_rows(cfg, "stop", stoppable, NO_ACTIVE) {
+        Ok(Menu::Show(rows)) => rows,
+        Ok(Menu::Empty) => return 0,
+        Err(code) => return code,
+    };
+    let picked = run_menu(rows, "WORKTREE  PORT  STATUS", true);
     for name in picked {
         commands::stop(cfg, Some(name));
     }
@@ -371,32 +436,15 @@ pub fn stop_pick(cfg: &Config) -> i32 {
 }
 
 /// restart: multi-select targets to stop then start (managed worktrees and the base
-/// checkout). Same rows as stop_pick, but each pick goes through commands::restart.
+/// checkout). Restarting a down target is meaningful (it starts it), so every target is
+/// offered; only "no targets at all" is worth a message.
 pub fn restart_pick(cfg: &Config) -> i32 {
-    if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
-        eprintln!("usage: dcw restart <target>   (run it in a terminal to pick from a list)");
-        return 2;
-    }
-    let mut rows = worktree_rows(cfg);
-    if cfg.repo.is_dir() {
-        let status = if base_running(cfg) { "up" } else { "down" };
-        rows.insert(
-            0,
-            WtRow {
-                name: "(repo)".into(),
-                branch: cfg.base.clone(),
-                dir: cfg.repo.clone(),
-                port: cfg.port_base.to_string(),
-                status: status.to_string(),
-            },
-        );
-    }
-    if rows.is_empty() {
-        eprintln!("no targets — nothing to restart");
-        return 1;
-    }
-    let menu: Vec<Row> = rows.iter().map(wt_menu_row).collect();
-    let picked = run_menu(menu, "WORKTREE  PORT  STATUS", true);
+    let rows = match state_menu_rows(cfg, "restart", |_| true, "no targets — nothing to restart") {
+        Ok(Menu::Show(rows)) => rows,
+        Ok(Menu::Empty) => return 0,
+        Err(code) => return code,
+    };
+    let picked = run_menu(rows, "WORKTREE  PORT  STATUS", true);
     for name in picked {
         commands::restart(cfg, Some(name));
     }
@@ -496,4 +544,102 @@ pub fn logs_pick(cfg: &Config) -> i32 {
     use std::os::unix::process::CommandExt;
     let _ = cmd.exec();
     0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(name: &str, port: &str, up: bool) -> WtRow {
+        WtRow {
+            name: name.into(),
+            branch: name.into(),
+            dir: PathBuf::from(format!("/wt/{name}")),
+            port: port.into(),
+            status: if up { "up" } else { "down" }.into(),
+        }
+    }
+
+    /// `stop` must offer only running targets: a down worktree has nothing to stop, and
+    /// offering it just buries the live rows.
+    #[test]
+    fn stop_offers_only_running_targets() {
+        let all = [row("a", "5201", true), row("b", "5202", false), row("c", "5203", true)];
+        let rows = menu_rows_for(&all, stoppable);
+        let names: Vec<&str> = rows.iter().map(|r| r.value.as_str()).collect();
+        assert_eq!(names, ["a", "c"]);
+    }
+
+    /// `start` is the mirror: only stopped targets are offerable.
+    #[test]
+    fn start_offers_only_stopped_targets() {
+        let all = [row("a", "5201", true), row("b", "5202", false), row("c", "5203", false)];
+        let rows = menu_rows_for(&all, startable);
+        let names: Vec<&str> = rows.iter().map(|r| r.value.as_str()).collect();
+        assert_eq!(names, ["b", "c"]);
+    }
+
+    /// All-down `stop` / all-up `start` leaves no row to draw — which the caller turns
+    /// into a successful no-op with a one-line note, not an empty menu.
+    #[test]
+    fn filters_can_empty_the_menu() {
+        assert!(menu_rows_for(&[row("a", "5201", false)], stoppable).is_empty());
+        assert!(menu_rows_for(&[row("a", "5201", true)], startable).is_empty());
+    }
+
+    /// The empty case still says something: a menu that never appears and prints nothing
+    /// reads as a crash or a swallowed command. Each note has to name the state the user
+    /// is actually in, so the two are distinct and mention the relevant half.
+    #[test]
+    fn empty_notes_name_the_state_that_produced_them() {
+        assert!(NO_ACTIVE.contains("nothing is running"), "{NO_ACTIVE}");
+        assert!(NONE_STOPPED.contains("everything is up"), "{NONE_STOPPED}");
+        assert_ne!(NO_ACTIVE, NONE_STOPPED);
+    }
+
+    /// The note is only reachable when the filter really left nothing behind.
+    #[test]
+    fn the_empty_note_matches_an_empty_selection() {
+        let all_down = [row("a", "5201", false)];
+        let all_up = [row("a", "5201", true)];
+        assert!(menu_rows_for(&all_down, stoppable).is_empty());
+        assert!(menu_rows_for(&all_up, startable).is_empty());
+    }
+
+    /// `restart` restarts anything (a down target is just started), so it never filters.
+    #[test]
+    fn restart_offers_every_target() {
+        let all = [row("a", "5201", true), row("b", "5202", false)];
+        assert_eq!(menu_rows_for(&all, |_| true).len(), 2);
+    }
+
+    /// Menu displays keep the "name port status" shape the header promises.
+    #[test]
+    fn menu_row_shows_port_and_status() {
+        let rows = menu_rows_for(&[row("a", "5201", true)], stoppable);
+        assert_eq!(rows[0].display, format!("{:<32} {:<7} {}", "a", "5201", "up"));
+    }
+
+    /// A switched worktree shows its branch, but a row with no branch (what `base_row`
+    /// produces for the main checkout) must NOT read as "switched": `(repo) → Inventory`
+    /// would suggest a worktree moved onto another branch, which is not what $REPO is.
+    #[test]
+    fn a_row_without_a_branch_keeps_its_bare_label() {
+        let repo_row = WtRow {
+            name: "(repo)".into(),
+            branch: String::new(),
+            dir: PathBuf::from("/repo"),
+            port: "5200".into(),
+            status: "down".into(),
+        };
+        assert_eq!(repo_row.label(), "(repo)");
+        assert_eq!(row("a", "5201", true).label(), "a");
+
+        let switched = WtRow {
+            name: "PRD_INV_1".into(),
+            branch: "fix/login".into(),
+            ..row("PRD_INV_1", "5201", true)
+        };
+        assert_eq!(switched.label(), "PRD_INV_1 → fix/login");
+    }
 }

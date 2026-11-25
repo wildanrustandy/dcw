@@ -47,6 +47,24 @@ dcw uninstall           hapus dcw dari mesin
 ada. Tanpa argumen, `start`/`stop`/`restart`/`abort`/`logs`/`jump` membuka **menu panah**
 (butuh TTY; di script/cron, sebut worktree secara eksplisit).
 
+**Menu hanya menampilkan yang relevan.** `dcw stop` (tanpa argumen) hanya menampilkan
+worktree yang sedang **up** — yang mati tidak bisa di-stop, jadi barisnya cuma membuat yang
+hidup sulit ditemukan. `dcw start` kebalikannya: hanya worktree yang **down**. Kalau tidak
+ada yang bisa dikerjakan, dcw tetap memberi tahu dengan satu baris dan keluar `0`:
+
+```
+$ dcw stop
+no active worktrees — nothing is running
+
+$ dcw start
+no stopped worktrees — everything is up
+```
+
+Baris itu sengaja ada: menu yang tidak pernah muncul dan tanpa output apa pun mudah
+dibaca sebagai crash atau perintah yang gagal. Pesannya tetap keluar di script, karena
+"tidak ada pekerjaan" tidak perlu TTY untuk diketahui. `dcw restart`/`abort`/`jump` tetap
+menampilkan semua target, dan baris `(repo)` ikut disaring dengan aturan yang sama.
+
 **Beberapa worktree sekaligus.** `dcw new` menerima lebih dari satu nama:
 
 ```sh
@@ -80,9 +98,10 @@ diresolusi ke worktree yang memilikinya, tetapi output selalu menyebut nama work
 (mis. `dcw start Inventory`), label `(repo)`, path repo (`dcw start .` dari dalam repo,
 atau path absolut). Server-nya selalu jalan di `$REPO` pada `PORT_BASE`, log ke
 `logs/main.log`. `dcw stop`/`restart` menerima keempat bentuk itu juga, dan menu
-`dcw start`/`stop` ikut menampilkan baris `(repo)` saat captain-nya mati (`dcw abort`
-tetap menolak repo utama). Bila checkout utama sedang memegang branch lain, dcw
-memberi peringatan bahwa yang dilayani adalah branch itu.
+`dcw start`/`stop` ikut menampilkan baris `(repo)` mengikuti aturan status yang sama
+(`start` saat captain-nya mati, `stop` saat hidup; `dcw abort` tetap menolak repo utama).
+Bila checkout utama sedang memegang branch lain, dcw memberi peringatan bahwa yang
+dilayani adalah branch itu.
 
 `dcw jump` dan `dcw new` butuh fungsi shell `dcw()` yang ditulis oleh `dcw init --bin`
 (buka terminal baru setelahnya) — keduanya melakukan `cd` ke shell pemanggil: `jump`
