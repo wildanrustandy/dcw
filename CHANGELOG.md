@@ -17,13 +17,15 @@ Rilis pertama yang tersedia untuk umum adalah **0.1.0**; tidak ada tag 0.2.1 dan
   di-stop/di-start. Baris `(repo)` ikut aturan yang sama (`stop` saat captain hidup,
   `start` saat mati), dan `dcw restart`/`abort`/`jump` tetap menampilkan semua target.
 
-### Fixed
+### Added
 
-- `dcw stop` saat semua worktree sudah mati, dan `dcw start` saat semuanya sudah up,
-  kini tidak menampilkan apa pun dan keluar `0` — sebelumnya mencetak pesan
-  "no stopped targets"/tidak berguna di layar. Keputusan "tidak ada yang perlu
-  dikerjakan" dicek sebelum syarat TTY, jadi pemanggilan berulang di script tetap
-  senyap; panggilan yang memang punya target tapi tidak punya TTY tetap memberi usage.
+- `dcw stop` saat tidak ada worktree yang berjalan mencetak
+  `no active worktrees — nothing is running`, dan `dcw start` saat semuanya sudah hidup
+  mencetak `no stopped worktrees — everything is up` (keduanya keluar `0`). Sebelumnya
+  dcw diam saja: menu tidak muncul dan tidak ada output sama sekali, sehingga mudah
+  disangka crash atau perintah yang gagal. Pesan ini tetap dicetak di script — "tidak ada
+  pekerjaan" dicek sebelum syarat TTY; panggilan yang memang punya target tapi tidak
+  punya TTY tetap memberi usage.
 
 ## 0.2.13 — 2026-11-25
 

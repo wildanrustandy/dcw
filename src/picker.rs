@@ -281,44 +281,44 @@ fn menu_rows_for(rows: &[WtRow], want: impl Fn(&WtRow) -> bool) -> Vec<Row> {
     rows.iter().filter(|r| want(r)).map(wt_menu_row).collect()
 }
 
+/// What a state-filtered menu decided to do.
+enum Menu {
+    /// Draw this menu and act on the picks.
+    Show(Vec<Row>),
+    /// Nothing to act on: the note was printed and the command should succeed.
+    Empty,
+}
+
 /// Menu rows for a state-filtered command (`start`/`stop`/`restart`): every target that
 /// `want` selects, in the shared menu shape.
 ///
-/// `Err(code)` means there is no menu to draw, and the caller should exit with `code`.
-/// The two reasons are checked in this order, and the order is the point:
+/// The empty case is checked BEFORE the terminal check, and that order is the point:
+/// "there is no work" does not need a tty to know, so a scripted `dcw stop` still gets
+/// the note instead of a usage error.
 ///
-/// 1. **An empty selection is the command's work already being done** — `dcw stop` with
-///    every captain down, `dcw start` with every captain up. That is a successful no-op,
-///    so it never becomes a menu and never becomes an error: `empty_note` picks how it
-///    reads, `None` for exit 0 with NO output at all (the `stop`/`start` contract),
-///    `Some(msg)` for a message and exit 1 (a command where "no targets" means the
-///    environment is wrong, not that the work is done). Deciding this BEFORE the
-///    terminal check is what makes `dcw stop` idempotent in a script: with nothing to
-///    stop it exits 0 quietly instead of demanding a tty.
-/// 2. **A missing terminal is a usage error** (`2`). There are targets to pick from and
-///    no way to pick, which no target state can fix.
+/// `Err(code)` is a usage error only — targets exist to pick from but there is no
+/// terminal to pick with, which no target state can fix.
 fn state_menu_rows(
     cfg: &Config,
     cmd: &str,
     want: impl Fn(&WtRow) -> bool,
-    empty_note: Option<&str>,
-) -> Result<Vec<Row>, i32> {
+    empty_note: &str,
+) -> Result<Menu, i32> {
     let base_up = base_running(cfg);
     let rows = menu_rows_for(&all_rows(cfg, base_up), want);
+    // An empty selection means the command has nothing to act on (`stop` with every
+    // captain down, `start` with every one up). That is a successful no-op, but a silent
+    // one is a bad answer to "did that work?" — the user asked for a menu and got no
+    // output at all, which reads as a crash or a swallowed command. Say so, and succeed.
     if rows.is_empty() {
-        return Err(match empty_note {
-            Some(note) => {
-                eprintln!("{note}");
-                1
-            }
-            None => 0,
-        });
+        eprintln!("{empty_note}");
+        return Ok(Menu::Empty);
     }
     if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
         eprintln!("usage: dcw {cmd} <target>   (run it in a terminal to pick from a list)");
         return Err(2);
     }
-    Ok(rows)
+    Ok(Menu::Show(rows))
 }
 
 /// jump: pick a single worktree (up or dead) and print its directory. The base
@@ -396,12 +396,20 @@ fn stoppable(r: &WtRow) -> bool {
     r.up()
 }
 
+/// Said by `dcw stop` when nothing is running. The menu never appears, so this line is
+/// the only answer the user gets — it has to name the state, not just imply it.
+pub const NO_ACTIVE: &str = "no active worktrees — nothing is running";
+
+/// Said by `dcw start` when everything is already up.
+pub const NONE_STOPPED: &str = "no stopped worktrees — everything is up";
+
 /// start: pick a stopped target and start it. Only targets that are DOWN are offered
 /// (managed worktrees and the base checkout, which runs in $REPO itself). When every
-/// target is already up there is nothing to start, so the command exits silently.
+/// target is already up, say so — there is nothing to start.
 pub fn start_pick(cfg: &Config) -> i32 {
-    let rows = match state_menu_rows(cfg, "start", startable, None) {
-        Ok(rows) => rows,
+    let rows = match state_menu_rows(cfg, "start", startable, NONE_STOPPED) {
+        Ok(Menu::Show(rows)) => rows,
+        Ok(Menu::Empty) => return 0,
         Err(code) => return code,
     };
     let picked = run_menu(rows, "WORKTREE  PORT  STATUS", false);
@@ -413,10 +421,11 @@ pub fn start_pick(cfg: &Config) -> i32 {
 
 /// stop: multi-select targets to stop. Only targets that are UP are offered — stopping
 /// something already down is a no-op, and dead rows only make the live ones harder to
-/// find. When every target is down the command exits silently.
+/// find. When nothing is running, say so — there is nothing to stop.
 pub fn stop_pick(cfg: &Config) -> i32 {
-    let rows = match state_menu_rows(cfg, "stop", stoppable, None) {
-        Ok(rows) => rows,
+    let rows = match state_menu_rows(cfg, "stop", stoppable, NO_ACTIVE) {
+        Ok(Menu::Show(rows)) => rows,
+        Ok(Menu::Empty) => return 0,
         Err(code) => return code,
     };
     let picked = run_menu(rows, "WORKTREE  PORT  STATUS", true);
@@ -430,8 +439,9 @@ pub fn stop_pick(cfg: &Config) -> i32 {
 /// checkout). Restarting a down target is meaningful (it starts it), so every target is
 /// offered; only "no targets at all" is worth a message.
 pub fn restart_pick(cfg: &Config) -> i32 {
-    let rows = match state_menu_rows(cfg, "restart", |_| true, Some("no targets — nothing to restart")) {
-        Ok(rows) => rows,
+    let rows = match state_menu_rows(cfg, "restart", |_| true, "no targets — nothing to restart") {
+        Ok(Menu::Show(rows)) => rows,
+        Ok(Menu::Empty) => return 0,
         Err(code) => return code,
     };
     let picked = run_menu(rows, "WORKTREE  PORT  STATUS", true);
@@ -570,11 +580,30 @@ mod tests {
     }
 
     /// All-down `stop` / all-up `start` leaves no row to draw — which the caller turns
-    /// into a silent success, not an empty menu.
+    /// into a successful no-op with a one-line note, not an empty menu.
     #[test]
     fn filters_can_empty_the_menu() {
         assert!(menu_rows_for(&[row("a", "5201", false)], stoppable).is_empty());
         assert!(menu_rows_for(&[row("a", "5201", true)], startable).is_empty());
+    }
+
+    /// The empty case still says something: a menu that never appears and prints nothing
+    /// reads as a crash or a swallowed command. Each note has to name the state the user
+    /// is actually in, so the two are distinct and mention the relevant half.
+    #[test]
+    fn empty_notes_name_the_state_that_produced_them() {
+        assert!(NO_ACTIVE.contains("nothing is running"), "{NO_ACTIVE}");
+        assert!(NONE_STOPPED.contains("everything is up"), "{NONE_STOPPED}");
+        assert_ne!(NO_ACTIVE, NONE_STOPPED);
+    }
+
+    /// The note is only reachable when the filter really left nothing behind.
+    #[test]
+    fn the_empty_note_matches_an_empty_selection() {
+        let all_down = [row("a", "5201", false)];
+        let all_up = [row("a", "5201", true)];
+        assert!(menu_rows_for(&all_down, stoppable).is_empty());
+        assert!(menu_rows_for(&all_up, startable).is_empty());
     }
 
     /// `restart` restarts anything (a down target is just started), so it never filters.

@@ -49,11 +49,21 @@ ada. Tanpa argumen, `start`/`stop`/`restart`/`abort`/`logs`/`jump` membuka **men
 
 **Menu hanya menampilkan yang relevan.** `dcw stop` (tanpa argumen) hanya menampilkan
 worktree yang sedang **up** — yang mati tidak bisa di-stop, jadi barisnya cuma membuat yang
-hidup sulit ditemukan. `dcw start` kebalikannya: hanya worktree yang **down**. Kalau semua
-worktree sudah mati, `dcw stop` tidak menampilkan apa pun dan keluar `0` tanpa pesan
-(begitu pula `dcw start` saat semuanya sudah up) — jadi `dcw stop`/`dcw start` boleh dipanggil
-berulang di script tanpa mengotori output. `dcw restart`/`abort`/`jump` tetap menampilkan
-semua target, dan baris `(repo)` ikut disaring dengan aturan yang sama.
+hidup sulit ditemukan. `dcw start` kebalikannya: hanya worktree yang **down**. Kalau tidak
+ada yang bisa dikerjakan, dcw tetap memberi tahu dengan satu baris dan keluar `0`:
+
+```
+$ dcw stop
+no active worktrees — nothing is running
+
+$ dcw start
+no stopped worktrees — everything is up
+```
+
+Baris itu sengaja ada: menu yang tidak pernah muncul dan tanpa output apa pun mudah
+dibaca sebagai crash atau perintah yang gagal. Pesannya tetap keluar di script, karena
+"tidak ada pekerjaan" tidak perlu TTY untuk diketahui. `dcw restart`/`abort`/`jump` tetap
+menampilkan semua target, dan baris `(repo)` ikut disaring dengan aturan yang sama.
 
 **Beberapa worktree sekaligus.** `dcw new` menerima lebih dari satu nama:
 
